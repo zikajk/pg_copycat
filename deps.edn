@@ -1,0 +1,3 @@
+{:aliases {:remove-clojure {:classpath-overrides {org.clojure/clojure nil
+                                                  org.clojure/spec.alpha nil
+                                                  org.clojure/core.specs.alpha nil}}}}

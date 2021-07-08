@@ -1,0 +1,135 @@
+* pg_copycat
+pg_copycat is a CLI tool designed to reduce/copy Postgresql database:
+- Data are exported base on [[Datasets]] defined in EDN files, [[https://github.com/seancorfield/honeysql/tree/v2][honeysql 2]] is used..
+- Pg_copycat can be easily automated and files can be regularly exported to / imported from Google Cloud Storage.
+  - Both export and import supports two main actions (see [[actions]]) - structure export / import and data export / import.
+  - Each export zip file is time-stamped, so you can easily import the structure and datasets back at any time.
+  - You must have GCLOUD tools installed and authenticated if you want to use Google Cloud Storage.
+- *Main goal*: help you develop locally so you do not have to connect to remote Postgres DB.
+  - Pg_copycat is meant to solve the problem where you want to develop an ETL or report on local 'replica'.
+  - Just run a Postgres DB in your Docker and import what you need...
+- *Non goal*: replace existing tools for complete database migration.
+  - Pg_copycat purpose is to reduce big Postgres DWH for your temporary needs, not to create a perfect copy.
+
+** Getting Started
+  1) Clone the repository.
+  2) =$ cd pg_copycat/build=
+  3) =$ sudo chmod 755 pg_copycat=
+  4) Create a configuration file like this (you can have many for multiple DBs):
+     - /I recommend you to use =.pgpass= so you do not have to enter password manually during export or import./
+     #+BEGIN_EXAMPLE
+  {:dbtype   "postgresql"
+  :dbname   "postgres"
+  :port      5435
+  :host     "localhost"
+  :username "postgres"}
+     #+END_EXAMPLE
+  5) =$ ./pg_copycat -c config.edn -d  ../dataset/example.edn export-all=
+  6) *That will start the export of structure and data.*
+     - If you have a problem other than not connecting to the database, try checking the installed software via =pg_copycat doctor=.
+     - Maybe you are missing *psql for import and pg_dump for export* - these are required!
+  7) =$ ./pg_copycat -c config.edn -d base import-all=
+     - Will start import of all files exported in previous step to the different database server.
+
+** Examples
+   - Export structure and data defined in base.edn dataset to Google Cloud Storage:
+      - =$ pg_copycat -c config.edn -d ../dataset/base.edn -g "gs://${BUCKET_NAME}" export-all=
+   - Import last exported structure from Google Cloud Storage:
+     - =$ pg_copycat -c config.edn -g "gs://${BUCKET_NAME}" import-structure=
+   - Import two specific datasets and do not change the database structure in any way:
+     - =$ pg_copycat -c config.edn -d base_235975 -d extra_3245356 import-data=
+
+   - You can load last file without knowing its full name, use just part of its filename you know.
+   - You can load or export multiple datasets by specifying =-d= multiple times.
+   
+** Actions
+pg_copycat offers you three (or four) import and export <<actions>>:
+  1. export-*structure*: /all information related to table/schema definition, sequences, constrains and settings. pg_copycat does not export owner information!/
+  2. export-*data*: /table plain-text data defined in EDN datasets./
+  4. export-*complete*: /runs structure and data export - so you can do both in one step./
+
+  - *same actions applies for import!*
+
+** Usage
+  Run at the command line for options:
+#+BEGIN_EXAMPLE
+$ ./pg_copycat --help
+
++------------------------+
+|   /\    ______  ___    |
+|  /  \  /      \/   \   |
+| ( /  |/ __    _\ /  )  |
+|  \ /  (/ x)  ( x) / )  |
+|   \_  (_  )   \ )  /   |
+|     \  /\_/    \)_/    |
+|      \/  //|  |\\      |
+|      /   v |  | v      |
+|     /     \__/    \    |
+|    /               \   |
+|   |     (^^\/^^)    |  |
+|   |      \^  ^/     |  |
+|   |       \^^/      |  |
+|   |        \/       |  |
+|    \_______________/   |
+|    pg_copycat   0.0.1  |
+|                        |
++------------------------+
+
+Usage: pg_copycat [options] action
+
+Options:
+  -c, --config-path CONFIG-PATH}  config.edn  A path to EDN config file containing a database configuration.
+  -d, --dataset DATASET           []          Specifies the dataset to be imported or exported. Can be used more than once.
+  -g, --gcs GCS                               The name of GCS you will use for import or export.
+  -f, --filename FILENAME         nil         Search for a file during import - use a partion or an exact filename.
+  -H, --help                                  Print this help information
+      --version                               Print version and exit
+
+Actions:
+  doctor              Check installed software.
+  export-structure    Export DB structure to a timestamped ZIP file.
+  export-data         Export dataset(s)' ZIP file(s).
+  export-all          Run export-structure and export-data.
+  import-structure    Import structure ZIP file.
+  import-data         Import dataset(s)' ZIP file(s).
+  import-all          Run import-structure and import-data..
+
+Please refer to the manual page for more information.
+#+END_EXAMPLE
+
+** Dataset
+   - <<Datasets>> are defined in EDN files - each dataset is a vector containing any number of hash-maps.
+   - Using hash-map ={:name xxx}= will generate =select * from xxx= , but you can add additional keywords like =:where= and so on.
+     - These extra parameters should be compatible with [[https://github.com/seancorfield/honeysql/tree/v2][honeysql v2]].
+   - You can see a sample dataset in =pg_copycat/dataset/example.edn=.
+   - Example of hash-maps and produced SQL queries:
+   #+BEGIN_EXAMPLE SQL1 
+     {:name :public.foo
+      :where  [:= :foo.a "baz"]}
+
+     => "SELECT * FROM public.foo WHERE foo.a = baz" 
+   #+END_EXAMPLE
+
+   #+BEGIN_EXAMPLE SQL1 
+     {:name :public.foo
+      :order-by [:foo.baz :desc]
+      :limit 50}
+      
+     => "SELECT * FROM foo ORDER BY foo.baz DESC LIMIT 50 " 
+   #+END_EXAMPLE
+   
+
+** Installation
+   - pg_copycat is distributed for linux and macos as a single executable file.
+   1. *you must install [[https://github.com/babashka/babashka]]*:
+      - if you run =$ install.sh= from this folder it might install *babashka* for you.
+   2. Copy the =build/pg_copycat= file to:
+      - =$HOME/bin= for local installation
+      - =/usr/local= for system installation
+
+** Development
+   - dependencies are defined in =bb.edn=
+   - source code is in =/src= folder
+   - Once you do your changes you might run =compile.sh=:
+     - it will produce babashka's uberscript in =/build= folder.
+     - it will pack all dependencies but babashka itself.

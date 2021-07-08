@@ -1,0 +1,3516 @@
+#!/usr/bin/env bb
+(ns clojure.term.colors)
+
+(defn- escape-code
+  [i]
+  (str "\033[" i "m"))
+
+(def ^:dynamic *colors*
+  "foreground color map"
+  (zipmap [:grey :red :green :yellow
+           :blue :magenta :cyan :white]
+          (map escape-code
+               (range 30 38))))
+
+(def ^:dynamic *highlights*
+  "background color map"
+  (zipmap [:on-grey :on-red :on-green :on-yellow
+           :on-blue :on-magenta :on-cyan :on-white]
+          (map escape-code
+            (range 40 48))))
+
+(def ^:dynamic *attributes*
+  "attributes color map"
+  (into {}
+        (filter (comp not nil? key)
+                (zipmap [:bold, :dark, nil, :underline,
+                         :blink, nil, :reverse-color, :concealed]
+                        (map escape-code (range 1 9))))))
+
+(def ^:dynamic *reset* (escape-code 0))
+
+;; Bind to true to have the colorize functions not apply coloring to
+;; their arguments.
+(def ^:dynamic *disable-colors* nil)
+
+(defmacro define-color-function
+  "define a function `fname' which wraps its arguments with
+        corresponding `color' codes"
+  [fname color]
+  (let [fname (symbol (name fname))
+        args (symbol 'args)]
+    `(defn ~fname [& ~args]
+       (if-not *disable-colors*
+         (str (clojure.string/join (map #(str ~color %) ~args)) ~*reset*)
+         (apply str ~args)))))
+
+(defn define-color-functions-from-map
+  "define functions from color maps."
+  [colormap]
+  (eval `(do ~@(map (fn [[color escape-code]]
+                `(println ~color ~escape-code)
+                `(define-color-function ~color ~escape-code))
+                    colormap))))
+
+(define-color-functions-from-map *colors*)
+(define-color-functions-from-map *highlights*)
+(define-color-functions-from-map *attributes*)
+(ns pg-copycat.utils
+  (:require [clojure.java.shell :as shell]
+            [clojure.string :as string] 
+            [babashka.fs :as fs]
+            [clojure.term.colors :as c]))
+
+
+(defn zero-exit? [m]
+  (cond
+    (zero? (:exit m)) true
+    :else             false))
+
+(defn gcloud-auth? []
+  (zero-exit? (shell/sh "gcloud" "auth" "print-identity-token")))
+
+(defn valid-bucket? [options]
+  (if-let [gcs-uri (:gcs options)]
+    (zero-exit? (shell/sh "gsutil" "ls" gcs-uri))
+    true))
+
+(defmulti connected?
+  (fn [ds-opts]
+    (:dbtype ds-opts)))
+
+(defmethod connected? "postgresql" [ds-opts]
+  (let [{:keys [host port dbname username]} ds-opts]
+    (zero-exit? (shell/sh "pg_isready" "-d" dbname "-h" host "-p" (str port) "-U" username))))
+
+(defn touch-dir!
+  "Checks if the path exists.
+  If not, creates a path based on <folders>."
+  [main-folder & folders]
+  (let [path (apply fs/file (cons main-folder folders))]
+    (when-not (fs/exists? path) (fs/create-dirs path))
+    path))
+
+(defn filename-no-ext
+  "Removes directories and extension from filename."
+  [file]
+  (-> file fs/file-name fs/split-ext first))
+
+
+(defn parse-timestamp [s]
+  (-> (fs/file-name s)
+      (string/split #"_")
+      last
+      fs/split-ext
+      first))
+
+(defn valid-file? [file prefix]
+  (and (string/starts-with? file prefix)
+       (string/ends-with? file ".zip")))
+
+(defn list-files [f-mask gcs]
+  (if (string? gcs)
+    (string/split (:out (shell/sh "gsutil" "ls" (format "%s/%s*.zip" gcs f-mask))) #"\n")
+    (filterv #(valid-file? % f-mask) (map fs/file-name (fs/list-dir ".")))))
+
+(defn prompt []
+  (println "Do you want to continue [y/n]?")
+  (= (read-line) "y"))
+
+(defn status-map [output message ok?]
+  {:out output
+   :message message
+   :ok? ok?})
+
+(defn move-to-bucket [filename gs-uri]
+ (shell/sh
+  "gsutil" "-m"
+  "mv" filename
+  (format "%s/%s" gs-uri filename)))
+
+(defn move-file! [filename gcs]
+  (if gcs
+    (move-to-bucket filename gcs)
+    (fs/move filename (System/getProperty "user.dir"))))
+
+(defn zip-filename [folder]
+  (str (format "%s_%d.zip" (fs/file-name folder)
+               (quot (System/currentTimeMillis) 1000))))
+
+(defn- zip-folder!
+  [folder filename]
+  (shell/sh "zip" "-j"
+            "-r" filename
+            (str folder)))
+
+(defn zip-and-delete!
+  "Zips and then deleted folder on path."
+  [folder filename]
+  (zip-folder! folder filename)
+  (fs/delete-tree folder))
+
+(defn unzip!
+  [filename target-folder]
+  (shell/sh "unzip" (str filename)
+            "-d" (str target-folder)))
+
+(defn complete-filemask [filename prefix]
+  (if (string/starts-with? filename prefix)
+    filename
+    (format "%s_%s" prefix filename)))
+
+(defn structure-f [f]
+  (if f (complete-filemask f "structure")
+      "structure"))
+
+(defn data-f [f]
+  (complete-filemask f "dataset"))
+
+(defn download-from-bucket! [gcs-uri]
+  (when (seq gcs-uri)
+    (println (c/green (format "Downloading : %s" gcs-uri)))
+    (shell/sh "gsutil" "-m" "cp" gcs-uri (fs/file-name gcs-uri))
+    (fs/file-name gcs-uri)))
+(ns pg-copycat.import
+  (:require
+   [pg-copycat.utils :as u]
+   [clojure.java.shell :as shell]
+   [babashka.fs :as fs]
+   [clojure.term.colors :as c]))
+
+(def temp-folder (fs/temp-dir))
+
+(defn import-mode [mode filename]
+  (case mode
+    :execute ["-f" filename]
+    :copy    ["-c" (format "\\COPY %s FROM '%s' USING DELIMITERS '|' CSV HEADER" (fs/file-name filename) filename)]))
+
+(defn psql-cmd! [{:keys [host port dbname username]} filename mode]
+  (let [[extra-par extra-cmd] (import-mode mode (str filename))
+        stdout (shell/sh
+                "psql"
+                "-h" host
+                "-d" dbname
+                "-U" username
+                "-p" (str port)
+                extra-par extra-cmd)]
+    (if (u/zero-exit? stdout)
+      (u/status-map (:out stdout) (c/green (format "%s imported!" (fs/file-name filename))) true)
+      (u/status-map (:out stdout) (c/red (:err stdout)) false))))
+
+(defn import-folder! [folder db-opts mode]
+  (let [i-files (map-indexed vector (fs/list-dir folder))]
+    (for [[i f] i-files]
+      (do (println (format "Importing %s ... %d / %d"
+                           (fs/file-name f)
+                           (inc i)
+                           (count i-files)))
+          (let [cmdout (psql-cmd! db-opts f mode)]
+            (println (:message cmdout))
+            cmdout)))))
+
+(defn unzip-and-import! [cmdout folder db-opts mode-kw]
+  (println (:message cmdout))
+  (when (:ok? cmdout)
+    (when (u/prompt)
+      (u/unzip! (:out cmdout) folder)
+      (doall
+       (import-folder! folder db-opts mode-kw))
+       (fs/delete-tree folder)
+       (println (c/green "Import finished!")))))
+
+(defn select-file! [gcs-uri gcs]
+  (if (string? gcs)
+    (u/download-from-bucket! gcs-uri)
+    gcs-uri))
+
+(defn get-file! [f-mask gcs]
+  (let [files (u/list-files f-mask gcs)
+        last-file (last (sort-by u/parse-timestamp files))]
+    (println (format "Founded files : %s" files))
+    (if-let [file (select-file! last-file gcs)]
+      (u/status-map (fs/file-name file)
+                    (c/green (format "Chosen file : %s" last-file))
+                    true)
+      (u/status-map nil
+                    (c/red "Nothing has been found!")
+                    false)))) 
+
+(defn import-structure!
+  "Imports complete pre-data.
+  It created one schema per file"
+  [opts]
+  (let [searched (u/structure-f (:filename opts))
+        cmdout (get-file! searched (:gcs opts))
+        folder (u/touch-dir! temp-folder "structure")]
+    (unzip-and-import! cmdout folder opts :execute)))
+
+(defn import-data!
+  "Imports table data based on dataset' configurations."
+  [opts]
+  (doseq [f (:dataset opts)]
+    (let [searched (u/data-f f)
+          cmdout (get-file! searched (:gcs opts))
+          folder (u/touch-dir! temp-folder "dataset")]
+      (unzip-and-import! cmdout folder opts :copy))))
+
+;; copyright (c) 2020-2021 sean corfield, all rights reserved
+
+(ns honey.sql
+  "Primary API for HoneySQL 2.x.
+
+  This includes the `format` function -- the primary entry point -- as well
+  as several public formatters that are intended to help users extend the
+  supported syntax.
+
+  In addition, functions to extend HoneySQL are also provided here:
+  * `clause-order` -- returns the current clause priority ordering;
+        intended as aid when registering new clauses.
+  * `format-dsl` -- intended to format SQL statements; returns a vector
+        containing a SQL string followed by parameter values.
+  * `format-entity` -- intended to format SQL entities; returns a string
+        representing the SQL entity.
+  * `format-expr` -- intended to format SQL expressions; returns a vector
+        containing a SQL string followed by parameter values.
+  * `format-expr-list` -- intended to format a list of SQL expressions;
+        returns a pair comprising: a sequence of SQL expressions (to be
+        join with a delimiter) and a sequence of parameter values.
+  * `register-clause!` -- register a new statement/clause formatter.
+  * `register-fn!` -- register a new function call (or special syntax)
+        formatter.
+  * `register-op!` -- register a new operator formatter.
+  * `set-dialect!` -- set the default dialect to be used for formatting.
+  * `sql-kw` -- turns a Clojure keyword (or symbol) into SQL code (makes
+        it uppercase and replaces - with space). "
+  (:refer-clojure :exclude [format])
+  (:require [clojure.string :as str]))
+
+;; default formatting for known clauses
+
+(declare format-dsl)
+(declare format-expr)
+(declare format-expr-list)
+
+;; dynamic dialect handling for formatting
+
+(declare clause-format)
+(def ^:private default-clause-order
+  "The (default) order for known clauses. Can have items added and removed."
+  [;; DDL comes first (these don't really have a precedence):
+   :alter-table :add-column :drop-column :modify-column :rename-column
+   :add-index :drop-index :rename-table
+   :create-table :create-table-as :with-columns
+   :create-view :create-materialized-view :create-extension
+   :drop-table :drop-view :drop-materialized-view :drop-extension
+   :refresh-materialized-view
+   ;; then SQL clauses in priority order:
+   :raw :nest :with :with-recursive :intersect :union :union-all :except :except-all
+   :select :select-distinct :select-distinct-on :select-top :select-distinct-top
+   :into :bulk-collect-into
+   :insert-into :update :delete :delete-from :truncate
+   :columns :set :from :using
+   :join-by
+   :join :left-join :right-join :inner-join :outer-join :full-join
+   :cross-join
+   :where :group-by :having
+   :window :partition-by
+   :order-by :limit :offset :fetch :for :lock :values
+   :on-conflict :on-constraint :do-nothing :do-update-set :on-duplicate-key-update
+   :returning
+   :with-data])
+
+(defn- add-clause-before
+  "Low-level helper just to insert a new clause.
+
+  If the clause is already in the list, remove it."
+  [order clause before]
+  (let [clauses (set order)
+        order   (if (contains? clauses clause)
+                  (filterv #(not= % clause) order)
+                  order)]
+    (if before
+      (do
+        (when-not (contains? clauses before)
+          (throw (ex-info (str "Unrecognized clause: " before)
+                          {:known-clauses order})))
+        (reduce (fn [v k]
+                  (if (= k before)
+                    (conj v clause k)
+                    (conj v k)))
+                []
+                order))
+      (conj order clause))))
+
+(def ^:private dialects
+  {:ansi      {:quote #(str \" % \")}
+   :sqlserver {:quote #(str \[ % \])}
+   :mysql     {:quote #(str \` % \`)
+               :clause-order-fn #(add-clause-before % :set :where)}
+   :oracle    {:quote #(str \" % \") :as false}})
+
+; should become defonce
+(def ^:private default-dialect (atom (:ansi dialects)))
+
+(def ^:private ^:dynamic *dialect* nil)
+;; nil would be a better default but that makes testing individual
+;; functions harder than necessary:
+(def ^:private ^:dynamic *clause-order* default-clause-order)
+(def ^:private ^:dynamic *quoted* nil)
+(def ^:private ^:dynamic *inline* nil)
+(def ^:private ^:dynamic *params* nil)
+;; there is no way, currently, to enable suspicious characters
+;; in entities; if someone complains about this check, an option
+;; can be added to format to turn this on:
+(def ^:private ^:dynamic *allow-suspicious-entities* false)
+
+;; clause helpers
+
+;; String.toUpperCase() or `str/upper-case` for that matter converts the
+;; string to uppercase for the DEFAULT LOCALE. Normally this does what you'd
+;; expect but things like `inner join` get converted to `İNNER JOİN` (dot over
+;; the I) when user locale is Turkish. This predictably has bad consequences
+;; for people who like their SQL queries to work. The fix here is to use
+;; String.toUpperCase(Locale/US) instead which always converts things the
+;; way we'd expect.
+;;
+;; Use this instead of `str/upper-case` as it will always use Locale/US.
+(def ^:private ^{:arglists '([s])} upper-case
+  ;; TODO - not sure if there's a JavaScript equivalent here we should be using as well
+  #?(:clj (fn [^String s] (.. s toString (toUpperCase (java.util.Locale/US))))
+     :cljs str/upper-case))
+
+(def ^:private keep-hyphen
+  "The set of symbols that should not have `-` replaced by space."
+  #{"-" "<->"})
+
+(defn sql-kw
+  "Given a keyword, return a SQL representation of it as a string.
+
+  A `:kebab-case` keyword becomes a `KEBAB CASE` (uppercase) string
+  with hyphens replaced by spaces, e.g., `:insert-into` => `INSERT INTO`.
+
+  Any namespace qualifier is ignored."
+  [k]
+  (-> k (name) (upper-case)
+      (as-> s (if (keep-hyphen s) s (str/replace s "-" " ")))))
+
+(defn- sym->kw
+  "Given a symbol, produce a keyword, retaining the namespace
+  qualifier, if any."
+  [s]
+  (if (symbol? s)
+    (if-let [n (namespace s)]
+      (keyword n (name s))
+      (keyword (name s)))
+    s))
+
+(defn- namespace-_ [x] (some-> (namespace x) (str/replace "-" "_")))
+(defn- name-_      [x] (str/replace (name x) "-" "_"))
+
+(defn- sqlize-value [x]
+  (cond
+    (nil? x)     "NULL"
+    (string? x)  (str \' (str/replace x "'" "''") \')
+    (ident? x)   (sql-kw x)
+    :else        (str x)))
+
+(defn format-entity
+  "Given a simple SQL entity (a keyword or symbol -- or string),
+  return the equivalent SQL fragment (as a string -- no parameters).
+
+  Handles quoting, splitting at / or ., replacing - with _ etc."
+  [x & [{:keys [aliased drop-ns]}]]
+  (let [nn    (if (or *quoted* (string? x)) name               name-_)
+        q     (if (or *quoted* (string? x)) (:quote *dialect*) identity)
+        [t c] (if-let [n (when-not (or drop-ns (string? x))
+                           (namespace-_ x))]
+                [n (nn x)]
+                (if aliased
+                  [nil (nn x)]
+                  (let [[t c] (str/split (nn x) #"\.")]
+                    (if c [t c] [nil t]))))
+        entity (cond->> c
+                 (not= "*" c)
+                 (q)
+                 t
+                 (str (q t) "."))
+        suspicious #";"]
+    (when-not *allow-suspicious-entities*
+      (when (re-find suspicious entity)
+        (throw (ex-info (str "suspicious character found in entity: " entity)
+                        {:disallowed suspicious}))))
+    entity))
+
+(comment
+  (for [v [:foo-bar 'foo-bar "foo-bar"
+           :f-o.bar 'f-o.bar "f-o.bar"]
+        a [true false] d [true false] q [true false]]
+    (binding [*dialect* (:mysql dialects) *quoted* q]
+      (format-entity v :aliased a :drop-ns d)))
+  .)
+
+(defn- param-value [k]
+  (if (contains? *params* k)
+    (get *params* k)
+    (throw (ex-info (str "missing parameter value for " k)
+                    {:params (keys *params*)}))))
+
+(defn- ->param [k]
+  (with-meta (constantly k)
+    {::wrapper
+     (fn [fk _] (param-value (fk)))}))
+
+(defn- format-var [x & [opts]]
+  (let [c (name-_ x)]
+    (cond (= \% (first c))
+          (let [[f & args] (str/split (subs c 1) #"\.")]
+            ;; TODO: this does not quote arguments -- does that matter?
+            [(str (upper-case f) "(" (str/join "," args) ")")])
+          (= \? (first c))
+          (let [k (keyword (subs c 1))]
+           (if *inline*
+             [(sqlize-value (param-value k))]
+             ["?" (->param k)]))
+          :else
+          [(format-entity x opts)])))
+
+(defn- format-entity-alias [x]
+  (cond (sequential? x)
+        (let [s     (first x)
+              pair? (< 1 (count x))]
+          (when (map? s)
+            (throw (ex-info "selectable cannot be statement!"
+                            {:selectable s})))
+          (cond-> (format-entity s)
+            pair?
+            (str (if (and (contains? *dialect* :as) (not (:as *dialect*))) " " " AS ")
+                 (format-entity (second x) {:aliased true}))))
+
+        :else
+        (format-entity x)))
+
+(defn- format-selectable-dsl [x & [{:keys [as aliased] :as opts}]]
+  (cond (map? x)
+        (format-dsl x {:nested true})
+
+        (sequential? x)
+        (let [s     (first x)
+              pair? (< 1 (count x))
+              a     (second x)
+              [sql & params] (if (map? s)
+                               (format-dsl s {:nested true})
+                               (format-expr s))
+              [sql' & params'] (when pair?
+                                 (if (sequential? a)
+                                   (let [[sql params] (format-expr-list a {:aliased true})]
+                                     (into [(str/join " " sql)] params))
+                                   (format-selectable-dsl a {:aliased true})))]
+          (-> [(cond-> sql
+                 pair?
+                 (str (if as
+                        (if (and (contains? *dialect* :as)
+                                 (not (:as *dialect*)))
+                          " "
+                          " AS ")
+                        " ") sql'))]
+              (into params)
+              (into params')))
+
+        (ident? x)
+        (if aliased
+          [(format-entity x opts)]
+          (format-var x opts))
+
+        (and aliased (string? x))
+        [(format-entity x opts)]
+
+        :else
+        (format-expr x)))
+
+;; primary clauses
+
+(defn- format-on-set-op [k xs]
+  (let [[sqls params]
+        (reduce (fn [[sql params] [sql' & params']]
+                  [(conj sql sql') (if params' (into params params') params)])
+                [[] []]
+                (map #(format-dsl % {:nested true}) xs))]
+    (into [(str/join (str " " (sql-kw k) " ") sqls)] params)))
+
+(defn format-expr-list
+  "Given a sequence of expressions represented as data, return a pair
+  where the first element is a sequence of SQL fragments and the second
+  element is a sequence of parameters. The caller should join the SQL
+  fragments with whatever appropriate delimiter is needed and then
+  return a vector whose first element is the complete SQL string and
+  whose subsequent elements are the parameters:
+
+  (let [[sqls params] (format-expr-list data opts)]
+    (into [(str/join delim sqls)] params))
+
+  This is intended to be used when writing your own formatters to
+  extend the DSL supported by HoneySQL."
+  [exprs & [opts]]
+  (reduce (fn [[sql params] [sql' & params']]
+            [(conj sql sql') (if params' (into params params') params)])
+          [[] []]
+          (map #(format-expr % opts) exprs)))
+
+(defn- format-columns [k xs]
+  (let [[sqls params] (format-expr-list xs {:drop-ns (= :columns k)})]
+    (into [(str "(" (str/join ", " sqls) ")")] params)))
+
+(defn- format-selects-common [prefix as xs]
+  (if (sequential? xs)
+    (let [[sqls params]
+          (reduce (fn [[sql params] [sql' & params']]
+                    [(conj sql sql') (if params' (into params params') params)])
+                  [[] []]
+                  (map #(format-selectable-dsl % {:as as}) xs))]
+      (into [(str prefix " " (str/join ", " sqls))] params))
+    (let [[sql & params] (format-selectable-dsl xs {:as as})]
+      (into [(str prefix " " sql)] params))))
+
+(defn- format-selects [k xs]
+  (format-selects-common
+   (sql-kw k)
+   (#{:select :select-distinct :from :window
+      'select 'select-distinct 'from 'window}
+    k)
+   xs))
+
+(defn- format-selects-on [_ xs]
+  (let [[on & cols] xs
+        [sql & params]
+        (format-expr (into [:distinct-on] on))
+        [sql' & params']
+        (format-selects-common
+         (str (sql-kw :select) " " sql)
+         true
+         cols)]
+    (-> [sql'] (into params) (into params'))))
+
+(defn- format-select-top [k xs]
+  (let [[top & cols] xs
+        [top & parts]
+        (if (sequential? top)
+          ;; could be an expression or a number followed by :percent :with-ties
+          (let [top-q?    #(and (ident? %)
+                                (#{:percent :with-ties} (sym->kw %)))
+                r-top     (reverse top)
+                top-quals (take-while top-q? r-top)
+                top-list  (drop-while top-q? r-top)]
+            (if (seq top-quals)
+              (if (= 1 (count top-list))
+                (into (vec top-list) (reverse top-quals))
+                (throw (ex-info "unparseable TOP expression"
+                                {:top top})))
+              [top]))
+          [top])
+        [sql & params]
+        (format-expr top)
+        [sql' & params']
+        (format-selects-common
+         (str (sql-kw k) "(" sql ")"
+              (when (seq parts) " ")
+              (str/join " " (map sql-kw parts)))
+         true
+         cols)]
+    (-> [sql'] (into params) (into params'))))
+
+(defn- format-select-into [k xs]
+  (let [[v e] (if (sequential? xs) xs [xs])
+        [sql & params] (when e (format-expr e))]
+    (into [(str (sql-kw k) " " (format-entity v)
+                (when sql
+                  (str " "
+                       (sql-kw (if (= :into k) :in :limit))
+                       " "
+                       sql)))]
+          params)))
+
+(defn- format-with-part [x]
+  (if (sequential? x)
+    (let [[sql & params] (format-dsl (second x))]
+      (into [(str (format-entity (first x)) " " sql)] params))
+    [(format-entity x)]))
+
+(defn- format-with [k xs]
+  ;; TODO: a sequence of pairs -- X AS expr -- where X is either [entity expr]
+  ;; or just entity, as far as I can tell...
+  (let [[sqls params]
+        (reduce (fn [[sql params] [sql' & params']]
+                  [(conj sql sql') (if params' (into params params') params)])
+                [[] []]
+                (map (fn [[x expr]]
+                       (let [[sql & params]   (format-with-part x)
+                             [sql' & params'] (format-dsl expr)]
+                         ;; according to docs, CTE should _always_ be wrapped:
+                         (cond-> [(str sql " AS " (str "(" sql' ")"))]
+                           params  (into params)
+                           params' (into params'))))
+                     xs))]
+    (into [(str (sql-kw k) " " (str/join ", " sqls))] params)))
+
+(defn- format-selector [k xs]
+  (format-selects k [xs]))
+
+(defn- format-insert [k table]
+  (if (sequential? table)
+    (cond (map? (second table))
+          (let [[table statement] table
+                [table cols]
+                (if (and (sequential? table) (sequential? (second table)))
+                  table
+                  [table])
+                [sql & params] (format-dsl statement)]
+            (into [(str (sql-kw k) " " (format-entity-alias table)
+                        " "
+                        (when (seq cols)
+                          (str "("
+                               (str/join ", " (map #'format-entity-alias cols))
+                               ") "))
+                        sql)]
+                  params))
+          (sequential? (second table))
+          (let [[table cols] table]
+            [(str (sql-kw k) " " (format-entity-alias table)
+                  " ("
+                  (str/join ", " (map #'format-entity-alias cols))
+                  ")")])
+          :else
+          [(str (sql-kw k) " " (format-entity-alias table))])
+    [(str (sql-kw k) " " (format-entity-alias table))]))
+
+(defn- format-join [k clauses]
+  (let [[sqls params]
+        (reduce (fn [[sqls params] [j e]]
+                  (let [[sql-j & params-j]
+                        (format-selects-common
+                         (sql-kw (if (= :join k) :inner-join k))
+                         true
+                         [j])
+                        sqls (conj sqls sql-j)]
+                    (if (and (sequential? e) (= :using (first e)))
+                      [(conj sqls
+                             "USING"
+                             (str "("
+                                  (str/join ", " (map #'format-entity-alias (rest e)))
+                                  ")"))
+                       (into params params-j)]
+                      (let [[sql & params'] (when e (format-expr e))]
+                        [(cond-> sqls e (conj "ON" sql))
+                         (into params params')]))))
+                [[] []]
+                (partition 2 clauses))]
+    (into [(str/join " " sqls)] params)))
+
+(def ^:private join-by-aliases
+  "Map of shorthand to longhand join names."
+  {:join  :inner-join
+   :left  :left-join
+   :right :right-join
+   :inner :inner-join
+   :outer :outer-join
+   :full  :full-join
+   :cross :cross-join})
+
+(def ^:private valid-joins
+  (set (vals join-by-aliases)))
+
+(defn- format-join-by
+  "Clauses should be a sequence of join types followed
+  by their table and condition, or a sequence of join
+  clauses, so that you can construct a series of joins
+  in a specific order."
+  [_ clauses]
+  (let [joins (if (every? map? clauses)
+                (into []
+                      (comp (mapcat #(mapcat (juxt key val) %))
+                            (map vector))
+                      clauses)
+                (partition-by ident? clauses))]
+    (when-not (even? (count joins))
+      (throw (ex-info ":join-by expects a sequence of join clauses"
+                      {:clauses clauses})))
+    (let [[sqls params]
+          (reduce (fn [[sqls params] [[j] [clauses]]]
+                    (let [j' (sym->kw j)
+                          j' (sym->kw (join-by-aliases j' j'))]
+                      (when-not (valid-joins j')
+                        (throw (ex-info (str ":join-by found an invalid join type "
+                                             j)
+                                        {})))
+                      (let [[sql' & params'] (format-dsl {j' clauses})]
+                        [(conj sqls sql') (into params params')])))
+                  [[] []]
+                  (partition 2 joins))]
+      (into [(str/join " " sqls)] params))))
+
+(defn- format-on-expr [k e]
+  (if (or (not (sequential? e)) (seq e))
+    (let [[sql & params] (format-expr e)]
+      (into [(str (sql-kw k) " " sql)] params))
+    []))
+
+(defn- format-group-by [k xs]
+  (let [[sqls params] (format-expr-list xs)]
+    (into [(str (sql-kw k) " " (str/join ", " sqls))] params)))
+
+(defn- format-order-by [k xs]
+  (let [dirs (map #(when (sequential? %) (second %)) xs)
+        [sqls params]
+        (format-expr-list (map #(if (sequential? %) (first %) %) xs))]
+    (into [(str (sql-kw k) " "
+                (str/join ", " (map (fn [sql dir]
+                                      (str sql " " (sql-kw (or dir :asc))))
+                                    sqls
+                                    dirs)))] params)))
+
+(defn- format-lock-strength [k xs]
+  (let [[strength tables nowait] (if (sequential? xs) xs [xs])]
+    [(str (sql-kw k) " " (sql-kw strength)
+          (when tables
+            (str
+              (cond (and (ident? tables)
+                         (#{:nowait :skip-locked :wait} (sym->kw tables)))
+                    (str " " (sql-kw tables))
+                    (sequential? tables)
+                    (str " OF "
+                         (str/join ", " (map #'format-entity tables)))
+                    :else
+                    (str " OF " (format-entity tables)))
+              (when nowait
+                (str " " (sql-kw nowait))))))]))
+
+(defn- format-values [k xs]
+  (cond (sequential? (first xs))
+        ;; [[1 2 3] [4 5 6]]
+        (let [n-1 (map count xs)
+              ;; issue #291: ensure all value sequences are the same length
+              xs' (if (apply = n-1)
+                    xs
+                    (let [n-n (apply max n-1)]
+                      (map (fn [x] (take n-n (concat x (repeat nil)))) xs)))
+              [sqls params]
+              (reduce (fn [[sql params] [sqls' params']]
+                        [(conj sql (str "(" (str/join ", " sqls') ")"))
+                         (into params params')])
+                      [[] []]
+                      (map #'format-expr-list xs'))]
+          (into [(str (sql-kw k) " " (str/join ", " sqls))] params))
+
+        (map? (first xs))
+        ;; [{:a 1 :b 2 :c 3}]
+        (let [cols-1 (keys (first xs))
+              ;; issue #291: check for all keys in all maps but still
+              ;; use the keys from the first map if they match so that
+              ;; users can rely on the key ordering if they want to,
+              ;; e.g., see test that uses array-map for the first row
+              cols-n (into #{} (mapcat keys) xs)
+              cols   (if (= (set cols-1) cols-n) cols-1 cols-n)
+              [sqls params]
+              (reduce (fn [[sql params] [sqls' params']]
+                        [(conj sql (str "(" (str/join ", " sqls') ")"))
+                         (if params' (into params params') params')])
+                      [[] []]
+                      (map (fn [m]
+                             (format-expr-list (map #(get m %) cols)))
+                           xs))]
+          (into [(str "("
+                      (str/join ", "
+                                (map #(format-entity % {:drop-ns true}) cols))
+                      ") "
+                      (sql-kw k)
+                      " "
+                      (str/join ", " sqls))]
+                params))
+
+        :else
+        (throw (ex-info ":values expects sequences or maps"
+                        {:first (first xs)}))))
+
+(comment
+  (into #{} (mapcat keys) [{:a 1 :b 2} {:b 3 :c 4}])
+  ,)
+
+(defn- format-set-exprs [k xs]
+  (let [[sqls params]
+        (reduce-kv (fn [[sql params] v e]
+                     (let [[sql' & params'] (format-expr e)]
+                       [(conj sql (str (format-entity v {:drop-ns true}) " = " sql'))
+                        (if params' (into params params') params)]))
+                   [[] []]
+                   xs)]
+    (into [(str (sql-kw k) " " (str/join ", " sqls))] params)))
+
+(defn- format-on-conflict [k x]
+  (cond (ident? x)
+        [(str (sql-kw k) " (" (format-entity x) ")")]
+        (map? x)
+        (let [[sql & params] (format-dsl x)]
+          (into [(str (sql-kw k) " " sql)] params))
+        (and (sequential? x)
+             (ident? (first x))
+             (map? (second x)))
+        (let [[sql & params] (format-dsl (second x))]
+          (into [(str (sql-kw k)
+                      " (" (format-entity (first x)) ") "
+                      sql)]
+                params))
+        (and (sequential? x) (= 1 (count x)))
+        (format-on-conflict k (first x))
+        (and (sequential? x) (= 0 (count x)))
+        [(sql-kw k)]
+        :else
+        (throw (ex-info "unsupported :on-conflict format"
+                        {:clause x}))))
+
+(defn- format-do-update-set [k x]
+  (cond (map? x)
+        (if (or (contains? x :fields) (contains? x 'fields))
+          (let [sets (str/join ", "
+                               (map (fn [e]
+                                      (let [e (format-entity e {:drop-ns true})]
+                                        (str e " = EXCLUDED." e)))
+                                    (or (:fields x)
+                                        ('fields x))))
+                where (or (:where x) ('where x))
+                [sql & params] (when where (format-dsl {:where where}))]
+            (into [(str (sql-kw k) " " sets
+                        (when sql (str " " sql)))] params))
+          (format-set-exprs k x))
+        (sequential? x)
+        (let [[cols clauses] (split-with (complement map?) x)]
+          (if (seq cols)
+            (recur k {:fields cols :where (:where (first clauses))})
+            (recur k (first clauses))))
+        :else
+        (let [e (format-entity x {:drop-ns true})]
+          [(str (sql-kw k) " " e " = EXCLUDED." e)])))
+
+(defn- format-simple-clause [c context]
+  (binding [*inline* true]
+    (let [[sql & params] (format-dsl c)]
+      (when (seq params)
+        (throw (ex-info (str "parameters are not accepted in " context)
+                        {:clause c :params params})))
+      sql)))
+
+(defn- format-simple-expr [e context]
+  (binding [*inline* true]
+    (let [[sql & params] (format-expr e)]
+      (when (seq params)
+        (throw (ex-info (str "parameters are not accepted in " context)
+                        {:expr e :params params})))
+      sql)))
+
+(defn- format-alter-table [k x]
+  (if (sequential? x)
+    [(str (sql-kw k) " " (format-entity (first x))
+          (when-let [clauses (next x)]
+            (str " " (str/join ", " (map #(format-simple-clause % "column/index operations") clauses)))))]
+    [(str (sql-kw k) " " (format-entity x))]))
+
+(defn- format-ddl-options
+  "Given a sequence of options for a DDL statement (the part that
+  comes between the entity name being created/dropped and the
+  remaining part of the statement), render clauses and sequences
+  of keywords and entity names. Returns a sequence of SQL strings."
+  [opts context]
+  (for [opt opts]
+    (cond (map? opt)
+          (format-simple-clause opt context)
+          (sequential? opt)
+          (str/join " "
+                    (map (fn [e]
+                           (if (ident? e)
+                             (sql-kw e)
+                             (format-simple-expr e context)))
+                         opt))
+          :else
+          (sql-kw opt))))
+
+(defn- destructure-create-item [table context]
+  (let [params
+        (if (sequential? table)
+          table
+          [table])
+        coll (take-while ident? params)
+        opts (drop-while ident? params)
+        ine  (last coll)
+        [prequel table ine]
+        (if (= :if-not-exists (sym->kw ine))
+          [(butlast (butlast coll)) (last (butlast coll)) ine]
+          [(butlast coll) (last coll) nil])]
+    (into [(str/join " " (map sql-kw prequel))
+           (format-entity table)
+           (when ine (sql-kw ine))]
+          (format-ddl-options opts context))))
+
+(defn- format-create [q k item as]
+  (let [[pre entity ine & more]
+        (destructure-create-item item (str (sql-kw q) " options"))]
+    [(str/join " " (remove nil?
+                           (-> [(sql-kw q)
+                                (when (and (= :create q) (seq pre)) pre)
+                                (sql-kw k)
+                                ine
+                                (when (and (= :refresh q) (seq pre)) pre)
+                                entity]
+                               (into more)
+                               (conj (when as (sql-kw as))))))]))
+
+(defn- format-with-data [_ data]
+  (let [data (if (sequential? data) (first data) data)]
+    [(str/join " " (remove nil?
+                           [(sql-kw :with)
+                            (when-not data (sql-kw :no))
+                            (sql-kw :data)]))]))
+
+(defn- destructure-drop-items [tables context]
+  (let [params
+        (if (sequential? tables)
+          tables
+          [tables])
+        coll (take-while ident? params)
+        opts (drop-while ident? params)
+        [if-exists & tables]
+        (if (#{:if-exists 'if-exists} (first coll))
+          coll
+          (cons nil coll))]
+    (into [(when if-exists (sql-kw :if-exists))
+           (str/join ", " (map #'format-entity tables))]
+          (format-ddl-options opts context))))
+
+(defn- format-drop-items
+  [k params]
+  (let [[if-exists tables & more] (destructure-drop-items params "DROP options")]
+    [(str/join " " (remove nil? (into [(sql-kw k) if-exists tables] more)))]))
+
+(defn- format-single-column [xs]
+  (str/join " " (let [[id & spec] (map #(format-simple-expr % "column operation") xs)]
+                  (cons id (map upper-case spec)))))
+
+(defn- format-table-columns [_ xs]
+  [(str "("
+        (str/join ", " (map #'format-single-column xs))
+        ")")])
+
+(defn- format-add-item [k spec]
+  [(str (sql-kw k) " " (format-single-column spec))])
+
+(defn- format-rename-item [k [x y]]
+  [(str (sql-kw k) " " (format-entity x) " TO " (format-entity y))])
+
+(defn- raw-render [s]
+  (if (sequential? s)
+    (let [[sqls params]
+          (reduce (fn [[sqls params] s]
+                    (if (sequential? s)
+                      (let [[sql & params'] (format-expr s)]
+                        [(conj sqls sql)
+                         (into params params')])
+                      [(conj sqls s) params]))
+                  [[] []]
+                  s)]
+      (into [(str/join sqls)] params))
+    [s]))
+
+(def ^:private base-clause-order
+  "The (base) order for known clauses. Can have items added and removed.
+
+  This is the 'pre-dialect' ordering."
+  (atom default-clause-order))
+
+(def ^:private current-clause-order
+  "The (current) order for known clauses. Can have items added and removed.
+
+  This is the 'post-dialect` ordering when a new default dialect is set."
+  (atom default-clause-order))
+
+(def ^:private clause-format
+  "The (default) behavior for each known clause. Can also have items added
+  and removed."
+  (atom {:alter-table     #'format-alter-table
+         :add-column      #'format-add-item
+         :drop-column     #'format-selector
+         :modify-column   #'format-add-item
+         :rename-column   #'format-rename-item
+         ;; so :add-index works with both [:index] and [:unique]
+         :add-index       (fn [_ x] (format-on-expr :add x))
+         :drop-index      #'format-selector
+         :rename-table    (fn [_ x] (format-selector :rename-to x))
+         :create-table    (fn [_ x] (format-create :create :table x nil))
+         :create-table-as (fn [_ x] (format-create :create :table x :as))
+         :create-extension (fn [_ x] (format-create :create :extension x nil))
+         :with-columns    #'format-table-columns
+         :create-view     (fn [_ x] (format-create :create :view x :as))
+         :create-materialized-view (fn [_ x] (format-create :create :materialized-view x :as))
+         :drop-table      #'format-drop-items
+         :drop-extension  #'format-drop-items
+         :drop-view       #'format-drop-items
+         :drop-materialized-view #'format-drop-items
+         :refresh-materialized-view (fn [_ x] (format-create :refresh :materialized-view x nil))
+         :raw             (fn [_ x] (raw-render x))
+         :nest            (fn [_ x] (format-expr x))
+         :with            #'format-with
+         :with-recursive  #'format-with
+         :intersect       #'format-on-set-op
+         :union           #'format-on-set-op
+         :union-all       #'format-on-set-op
+         :except          #'format-on-set-op
+         :except-all      #'format-on-set-op
+         :select          #'format-selects
+         :select-distinct #'format-selects
+         :select-distinct-on #'format-selects-on
+         :select-top      #'format-select-top
+         :select-distinct-top #'format-select-top
+         :into            #'format-select-into
+         :bulk-collect-into #'format-select-into
+         :insert-into     #'format-insert
+         :update          #'format-selector
+         :delete          #'format-selects
+         :delete-from     #'format-selector
+         :truncate        #'format-selector
+         :columns         #'format-columns
+         :set             #'format-set-exprs
+         :from            #'format-selects
+         :using           #'format-selects
+         :join-by         #'format-join-by
+         :join            #'format-join
+         :left-join       #'format-join
+         :right-join      #'format-join
+         :inner-join      #'format-join
+         :outer-join      #'format-join
+         :full-join       #'format-join
+         :cross-join      #'format-selects
+         :where           #'format-on-expr
+         :group-by        #'format-group-by
+         :having          #'format-on-expr
+         :window          #'format-selector
+         :partition-by    #'format-selects
+         :order-by        #'format-order-by
+         :limit           #'format-on-expr
+         :offset          #'format-on-expr
+         :fetch           #'format-on-expr
+         :for             #'format-lock-strength
+         :lock            #'format-lock-strength
+         :values          #'format-values
+         :on-conflict     #'format-on-conflict
+         :on-constraint   #'format-selector
+         :do-nothing      (fn [k _] (vector (sql-kw k)))
+         :do-update-set   #'format-do-update-set
+         ;; MySQL-specific but might as well be always enabled:
+         :on-duplicate-key-update #'format-do-update-set
+         :returning       #'format-selects
+         :with-data       #'format-with-data}))
+
+(assert (= (set @base-clause-order)
+           (set @current-clause-order)
+           (set (keys @clause-format))))
+
+(defn- kw->sym
+  "Given a keyword, produce a symbol, retaining the namespace
+  qualifier, if any."
+  [k]
+  (if (keyword? k)
+    (if-let [n (namespace k)]
+      (symbol n (name k))
+      (symbol (name k)))
+    k))
+
+(defn format-dsl
+  "Given a hash map representing a SQL statement and a hash map
+  of options, return a vector containing a string -- the formatted
+  SQL statement -- followed by any parameter values that SQL needs.
+
+  This is intended to be used when writing your own formatters to
+  extend the DSL supported by HoneySQL."
+  [statement-map & [{:keys [aliased nested pretty]}]]
+  (let [[sqls params leftover]
+        (reduce (fn [[sql params leftover] k]
+                  (if-some [xs (if-some [xs (k statement-map)]
+                                 xs
+                                 (let [s (kw->sym k)]
+                                   (get statement-map s)))]
+                    (let [formatter (k @clause-format)
+                          [sql' & params'] (formatter k xs)]
+                      [(conj sql sql')
+                       (if params' (into params params') params)
+                       (dissoc leftover k (kw->sym k))])
+                    [sql params leftover]))
+                [[] [] statement-map]
+                *clause-order*)]
+    (if (seq leftover)
+      (throw (ex-info (str "Unknown SQL clauses: "
+                            (str/join ", " (keys leftover)))
+                      leftover))
+      (into [(cond-> (str/join (if pretty "\n" " ") (filter seq sqls))
+               pretty
+               (as-> s (str "\n" s "\n"))
+               (and nested (not aliased))
+               (as-> s (str "(" s ")")))] params))))
+
+(def ^:private infix-aliases
+  "Provided for backward compatibility with earlier HoneySQL versions."
+  {:is :=
+   :is-not :<>
+   :not= :<>
+   :!= :<>
+   :regex :regexp})
+
+(def ^:private infix-ops
+  (-> #{"mod" "and" "or" "xor" "<>" "<=" ">=" "||" "<->"
+        "like" "not-like" "regexp"
+        "ilike" "not-ilike" "similar-to" "not-similar-to"
+        "is" "is-not" "not=" "!=" "regex"}
+      (into (map str "+-*%|&^=<>"))
+      (into (keys infix-aliases))
+      (into (vals infix-aliases))
+      (->> (into #{} (map keyword)))
+      (conj :/) ; because (keyword "/") does not work in cljs
+      (atom)))
+
+(def ^:private op-ignore-nil (atom #{:and :or}))
+(def ^:private op-variadic   (atom #{:and :or :+ :* :||}))
+
+(defn- unwrap [x opts]
+  (if-let [m (meta x)]
+    (if-let [f (::wrapper m)]
+      (f x opts)
+      x)
+    x))
+
+(defn- format-in [in [x y]]
+  (let [[sql-x & params-x] (format-expr x {:nested true})
+        [sql-y & params-y] (format-expr y {:nested true})
+        values             (unwrap (first params-y) {})]
+    (if (and (= "?" sql-y) (= 1 (count params-y)) (coll? values))
+      (let [sql (str "(" (str/join ", " (repeat (count values) "?")) ")")]
+        (-> [(str sql-x " " (sql-kw in) " " sql)]
+            (into params-x)
+            (into values)))
+      (-> [(str sql-x " " (sql-kw in) " " sql-y)]
+          (into params-x)
+          (into params-y)))))
+
+(defn- function-0 [k xs]
+  [(str (sql-kw k)
+        (when (seq xs)
+          (str "("
+               (str/join ", "
+                         (map #(format-simple-expr % "column/index operation")
+                              xs))
+               ")")))])
+
+(defn- function-1 [k xs]
+  [(str (sql-kw k)
+        (when (seq xs)
+          (str " " (format-simple-expr (first xs)
+                                       "column/index operation")
+               (when-let [args (next xs)]
+                 (str "("
+                      (str/join ", "
+                                 (map #(format-simple-expr % "column/index operation")
+                                      args))
+                      ")")))))])
+
+(defn- function-1-opt [k xs]
+  [(str (sql-kw k)
+        (when (seq xs)
+          (str (when-let [e (first xs)]
+                 (str " " (format-simple-expr e "column/index operation")))
+               (when-let [args (next xs)]
+                 (str "("
+                      (str/join ", "
+                                (map #(format-simple-expr % "column/index operation")
+                                     args))
+                      ")")))))])
+
+(defn- expr-clause-pairs
+  "For FILTER and WITHIN GROUP that have an expression
+  followed by a SQL clause."
+  [k pairs]
+  (let [[sqls params]
+        (reduce (fn [[sqls params] [e c]]
+                  (let [[sql-e & params-e] (format-expr e)
+                        [sql-c & params-c] (format-dsl c {:nested true})]
+                    [(conj sqls (str sql-e " " (sql-kw k) " " sql-c))
+                     (-> params (into params-e) (into params-c))]))
+                [[] []]
+                (partition 2 pairs))]
+    (into [(str/join ", " sqls)] params)))
+
+(def ^:private special-syntax
+  (atom
+   {;; these "functions" are mostly used in column
+    ;; descriptions so they generally have one of two forms:
+    ;; function-0 - with zero arguments, renders as a keyword,
+    ;;     otherwise renders as a function call
+    ;; function-1 - with zero arguments, renders as a keyword,
+    ;;     with one argument, as a keyword followed by an entity,
+    ;;     otherwise renders as a keyword followed by a function
+    ;;     call using the first entity as the function
+    ;; function-1-opt - like function-1 except if the first
+    ;;     argument is nil, it is omitted
+    :constraint  #'function-1
+    :default     #'function-1
+    :foreign-key #'function-0
+    :index       #'function-1-opt
+    :primary-key #'function-0
+    :references  #'function-1
+    :unique      #'function-1-opt
+    ;; used in DDL to force rendering as a SQL entity instead
+    ;; of a SQL keyword:
+    :entity      (fn [_ [e]] [(format-entity e)])
+    :array
+    (fn [_ [arr]]
+      (let [[sqls params] (format-expr-list arr)]
+        (into [(str "ARRAY[" (str/join ", " sqls) "]")] params)))
+    :between
+    (fn [_ [x a b]]
+      (let [[sql-x & params-x] (format-expr x {:nested true})
+            [sql-a & params-a] (format-expr a {:nested true})
+            [sql-b & params-b] (format-expr b {:nested true})]
+        (-> [(str sql-x " BETWEEN " sql-a " AND " sql-b)]
+            (into params-x)
+            (into params-a)
+            (into params-b))))
+    :case
+    (fn [_ clauses]
+      (let [[sqls params]
+            (reduce (fn [[sqls params] [condition value]]
+                      (let [[sqlc & paramsc] (when-not (= :else condition)
+                                               (format-expr condition))
+                            [sqlv & paramsv] (format-expr value)]
+                        [(if (or (= :else condition)
+                                 (= 'else condition))
+                           (conj sqls (sql-kw :else) sqlv)
+                           (conj sqls (sql-kw :when) sqlc (sql-kw :then) sqlv))
+                         (-> params (into paramsc) (into paramsv))]))
+                    [[] []]
+                    (partition 2 clauses))]
+        (into [(str (sql-kw :case) " "
+                    (str/join " " sqls)
+                    " " (sql-kw :end))]
+              params)))
+    :cast
+    (fn [_ [x type]]
+      (let [[sql & params]   (format-expr x)
+            [sql' & params'] (format-expr type)]
+        (-> [(str "CAST(" sql " AS " sql' ")")]
+            (into params)
+            (into params'))))
+    :composite
+    (fn [_ [& args]]
+      (let [[sqls params] (format-expr-list args)]
+        (into [(str "(" (str/join ", " sqls) ")")] params)))
+    :escape
+    (fn [_ [pattern escape-chars]]
+      (let [[sql-p & params-p] (format-expr pattern)
+            [sql-e & params-e] (format-expr escape-chars)]
+        (-> [(str sql-p " " (sql-kw :escape) " " sql-e)]
+            (into params-p)
+            (into params-e))))
+    :filter expr-clause-pairs
+    :inline
+    (fn [_ [x]]
+      (if (sequential? x)
+        [(str/join " " (map #'sqlize-value x))]
+        [(sqlize-value x)]))
+    :interval
+    (fn [_ [n units]]
+      (let [[sql & params] (format-expr n)]
+        (into [(str "INTERVAL " sql " " (sql-kw units))] params)))
+    :lateral
+    (fn [_ [clause-or-expr]]
+      (if (map? clause-or-expr)
+        (let [[sql & params] (format-dsl clause-or-expr)]
+          (into [(str "LATERAL (" sql ")")] params))
+        (let [[sql & params] (format-expr clause-or-expr)]
+          (into [(str "LATERAL " sql)] params))))
+    :lift
+    (fn [_ [x]]
+      (if *inline*
+        ;; this is pretty much always going to be wrong,
+        ;; but it could produce a valid result so we just
+        ;; assume that the user knows what they are doing:
+        [(sqlize-value x)]
+        ["?" (with-meta (constantly x)
+               {::wrapper (fn [fx _] (fx))})]))
+    :nest
+    (fn [_ [x]]
+      (format-expr x {:nested true}))
+    :not
+    (fn [_ [x]]
+      (let [[sql & params] (format-expr x)]
+        (into [(str "NOT " sql)] params)))
+    :order-by
+    (fn [k [e q]]
+      (let [[sql-e & params-e] (format-expr e)
+            [sql-q & params-q] (format-dsl {k [q]})]
+        (-> [(str sql-e " " sql-q)]
+            (into params-e)
+            (into params-q))))
+    :over
+    (fn [_ [& args]]
+      (let [[sqls params]
+            (reduce (fn [[sqls params] [e p a]]
+                      (let [[sql-e & params-e] (format-expr e)
+                            [sql-p & params-p] (if (or (nil? p) (map? p))
+                                                 (format-dsl p {:nested true})
+                                                 [(format-entity p)])]
+                        [(conj sqls (str sql-e " OVER " sql-p
+                                         (when a (str " AS " (format-entity a)))))
+                         (-> params (into params-e) (into params-p))]))
+                    [[] []]
+                    args)]
+        (into [(str/join ", " sqls)] params)))
+    :param
+    (fn [_ [k]]
+      (if *inline*
+        [(sqlize-value (param-value k))]
+        ["?" (->param k)]))
+    :raw
+    (fn [_ [xs]]
+      (raw-render xs))
+    :within-group expr-clause-pairs}))
+
+(defn format-expr
+  "Given a data structure that represents a SQL expression and a hash
+  map of options, return a vector containing a string -- the formatted
+  SQL statement -- followed by any parameter values that SQL needs.
+
+  This is intended to be used when writing your own formatters to
+  extend the DSL supported by HoneySQL."
+  [expr & [{:keys [nested] :as opts}]]
+  (cond (ident? expr)
+        (format-var expr opts)
+
+        (map? expr)
+        (format-dsl expr (assoc opts :nested true))
+
+        (sequential? expr)
+        (let [op (sym->kw (first expr))]
+          (if (keyword? op)
+            (cond (contains? @infix-ops op)
+                  (if (contains? @op-variadic op) ; no aliases here, no special semantics
+                    (let [x (if (contains? @op-ignore-nil op)
+                              (remove nil? expr)
+                              expr)
+                          [sqls params]
+                          (reduce (fn [[sql params] [sql' & params']]
+                                    [(conj sql sql')
+                                     (if params' (into params params') params)])
+                                  [[] []]
+                                  (map #(format-expr % {:nested true})
+                                       (rest x)))]
+                      (into [(cond-> (str/join (str " " (sql-kw op) " ") sqls)
+                               nested
+                               (as-> s (str "(" s ")")))]
+                            params))
+                    (let [[_ a b & y] expr
+                          _           (when (seq y)
+                                        (throw (ex-info (str "only binary "
+                                                             op
+                                                             " is supported")
+                                                        {:expr expr})))
+                          [s1 & p1]   (format-expr a {:nested true})
+                          [s2 & p2]   (format-expr b {:nested true})
+                          op          (get infix-aliases op op)]
+                        (if (and (#{:= :<>} op) (or (nil? a) (nil? b)))
+                          (-> (str (if (nil? a)
+                                     (if (nil? b) "NULL" s2)
+                                     s1)
+                                   (if (= := op) " IS NULL" " IS NOT NULL"))
+                              (cond-> nested
+                                (as-> s (str "(" s ")")))
+                              (vector))
+                          (-> (str s1 " " (sql-kw op) " " s2)
+                              (cond-> nested
+                                (as-> s (str "(" s ")")))
+                              (vector)
+                              (into p1)
+                              (into p2)))))
+                  (contains? #{:in :not-in} op)
+                  (let [[sql & params] (format-in op (rest expr))]
+                    (into [(if nested (str "(" sql ")") sql)] params))
+                  (contains? @special-syntax op)
+                  (let [formatter (get @special-syntax op)]
+                    (formatter op (rest expr)))
+                  :else
+                  (let [args          (rest expr)
+                        [sqls params] (format-expr-list args)]
+                    (into [(str (sql-kw op)
+                                (if (and (= 1 (count args))
+                                         (map? (first args))
+                                         (= 1 (count sqls)))
+                                  (str " " (first sqls))
+                                  (str "(" (str/join ", " sqls) ")")))]
+                          params)))
+            (let [[sqls params] (format-expr-list expr)]
+              (into [(str "(" (str/join ", " sqls) ")")] params))))
+
+        (boolean? expr)
+        [(upper-case (str expr))]
+
+        (nil? expr)
+        ["NULL"]
+
+        :else
+        (if *inline*
+          [(sqlize-value expr)]
+          ["?" expr])))
+
+(defn- check-dialect [dialect]
+  (when-not (contains? dialects dialect)
+    (throw (ex-info (str "Invalid dialect: " dialect)
+                    {:valid-dialects (vec (sort (keys dialects)))})))
+  dialect)
+
+(defn format
+  "Turn the data DSL into a vector containing a SQL string followed by
+  any parameter values that were encountered in the DSL structure.
+
+  This is the primary API for HoneySQL and handles dialects, quoting,
+  and named parameters.
+
+  `format` accepts options as either a single hash map argument or
+  as named arguments (alternating keys and values). If you are using
+  Clojure 1.11 (or later) you can mix'n'match, providing some options
+  as named arguments followed by other options in a hash map."
+  ([data] (format data {}))
+  ([data opts]
+   (let [dialect? (contains? opts :dialect)
+         dialect  (when dialect? (get dialects (check-dialect (:dialect opts))))]
+     (binding [*dialect* (if dialect? dialect @default-dialect)
+               *clause-order* (if dialect?
+                                (if-let [f (:clause-order-fn dialect)]
+                                  (f @base-clause-order)
+                                  @current-clause-order)
+                                @current-clause-order)
+               *inline*  (when (contains? opts :inline)
+                           (:inline opts))
+               *quoted*  (if (contains? opts :quoted)
+                           (:quoted opts)
+                           dialect?)
+               *params* (:params opts)]
+       (mapv #(unwrap % opts) (format-dsl data opts)))))
+  ([data k v & {:as opts}] (format data (assoc opts k v))))
+
+(defn set-dialect!
+  "Set the default dialect for formatting.
+
+  Can be: `:ansi` (the default), `:mysql`, `:oracle`, or `:sqlserver`.
+
+  Dialects are always applied to the base order to create the current order."
+  [dialect]
+  (reset! default-dialect (get dialects (check-dialect dialect)))
+  (when-let [f (:clause-order-fn @default-dialect)]
+    (reset! current-clause-order (f @base-clause-order))))
+
+(defn clause-order
+  "Return the current order that known clauses will be applied when
+  formatting a data structure into SQL. This may be useful when you are
+  figuring out the `before` argument of `register-clause!` as well as
+  for debugging new clauses you have registered."
+  []
+  @current-clause-order)
+
+(defn register-clause!
+  "Register a new clause formatter. If `before` is `nil`, the clause is
+  added to the end of the list of known clauses, otherwise it is inserted
+  immediately prior to that clause.
+
+  New clauses are registered in the base order and the current order so
+  that any dialect selections are able to include them while still working
+  predictably from the base order. Caveat: that means if you register a new
+  clause `before` a clause that is ordered differently in different
+  dialects, your new clause may also end up in a different place. The
+  only clause so far where that would matter is `:set` which differs in
+  MySQL.
+
+  Use `clause-order` to see the full ordering of existing clauses."
+  [clause formatter before]
+  (let [clause (sym->kw clause)
+        before (sym->kw before)]
+    (assert (keyword? clause))
+    (let [k (sym->kw formatter)
+          f (if (keyword? k)
+              (get @clause-format k)
+              formatter)]
+      (when-not (and f (fn? f))
+        (throw (ex-info "The formatter must be a function or existing clause"
+                        {:type (type formatter)})))
+      (swap! base-clause-order add-clause-before clause before)
+      (swap! current-clause-order add-clause-before clause before)
+      (swap! clause-format assoc clause f))))
+
+(defn register-fn!
+  "Register a new function (as special syntax). The `formatter` is either
+  a keyword, meaning that this new function should use the same syntax as
+  an existing function, or a function of two arguments that generates a
+  SQL string and parameters (as a vector). The two arguments are the name
+  of the function (as a keyword) and a sequence of the arguments from the
+  DSL."
+  [function formatter]
+  (let [function (sym->kw function)]
+    (assert (keyword? function))
+    (let [k (sym->kw formatter)
+          f (if (keyword? k)
+              (get @special-syntax k)
+              formatter)]
+      (when-not (and f (fn? f))
+        (throw (ex-info "The formatter must be a function or existing fn name"
+                        {:type (type formatter)})))
+      (swap! special-syntax assoc function f))))
+
+(defn register-op!
+  "Register a new infix operator. Operators can be defined to be variadic (the
+  default is that they are binary) and may choose to ignore `nil` arguments
+  (this can make it easier to programmatically construct the DSL)."
+  [op & {:keys [variadic ignore-nil]}]
+  (let [op (sym->kw op)]
+    (assert (keyword? op))
+    (swap! infix-ops conj op)
+    (when variadic
+      (swap! op-variadic conj op))
+    (when ignore-nil
+      (swap! op-ignore-nil conj op))))
+
+(comment
+  (format {:truncate :foo})
+  (format-expr [:= :id 1])
+  (format-expr [:+ :id 1])
+  (format-expr [:+ 1 [:+ 1 :quux]])
+  (format-expr [:foo [:bar [:+ 2 [:g :abc]]] [:f 1 :quux]])
+  (format-expr :id)
+  (format-expr 1)
+  (format {:select [:a [:b :c] [[:d :e]] [[:f :g] :h]]})
+  (format {:select [[[:d :e]] :a [:b :c]]})
+  (format-on-expr :where [:= :id 1])
+  (format-dsl {:select [:*] :from [:table] :where [:= :id 1]})
+  (format {:select [:t.*] :from [[:table :t]] :where [:= :id 1]} {})
+  (format {:select [:*] :from [:table] :group-by [:foo :bar]} {})
+  (format {:select [:*] :from [:table] :group-by [[:date :bar]]} {})
+  (format {:select [:*] :from [:table] :order-by [[:foo :desc] :bar]} {})
+  (format {:select [:*] :from [:table]
+           :order-by [[[:date :expiry] :desc] :bar]} {})
+  (println (format {:select [:*] :from [:table]
+                    :order-by [[[:date :expiry] :desc] :bar]} {:pretty true}))
+  (format {:select [:*] :from [:table]
+           :where [:< [:date_add :expiry [:interval 30 :days]] [:now]]} {})
+  (format-expr [:interval 30 :days])
+  (format {:select [:*] :from [:table]
+           :where [:= :id (int 1)]} {:dialect :mysql})
+  (map fn? (format {:select [:*] :from [:table]
+                    :where [:= :id (with-meta (constantly 42) {:foo true})]}
+                   {:dialect :mysql}))
+  (println (format {:select [:*] :from [:table]
+                    :where [:in :id [1 2 3 4]]} {:pretty true}))
+  (println (format {:select [:*] :from [:table]
+                    :where [:and [:in :id [1 [:param :foo]]]
+                            [:= :bar [:param :quux]]]}
+                   {:params {:foo 42 :quux 13}
+                    :pretty true}))
+  ;; while working on the docs
+  (require '[honey.sql :as sql])
+  (sql/format-expr [:array (range 5)])
+  (sql/format {:where [:and [:= :id 42] [:= :type "match"]]})
+  (sql/format {:where [:and [:= :type "match"] (when false [:in :status [1 5]])]})
+  (sql/format {:select [:*] :from [:table] :where [:= :id 1]})
+  (sql/format {:select [:t/id [:name :item]], :from [[:table :t]], :where [:= :id 1]})
+  (sql/format '{select [t/id [name item]], from [[table t]], where [= id 1]})
+  (sql/format '{select * from table where (= id 1)})
+  (require '[honey.sql.helpers :refer [select from where]])
+  (-> (select :t/id [:name :item])
+      (from [:table :t])
+      (where [:= :id 1])
+      (sql/format))
+  (-> (select :t/id)
+      (from [:table :t])
+      (where [:= :id 1])
+      (select [:name :item])
+      (sql/format))
+  (sql/format {:select [:*] :from [:table] :where [:= :id 1]} {:dialect :mysql})
+  (sql/format {:select [:foo/bar] :from [:q-u-u-x]} {:quoted true})
+  (sql/format {:select ["foo/bar"] :from [:q-u-u-x]} {:quoted true})
+  (sql/format-expr [:primary-key])
+  (sql/register-op! 'y)
+  (sql/format {:where '[y 2 3]})
+  (sql/register-op! :<=> :variadic true :ignore-nil true)
+  ;; and then use the new operator:
+  (sql/format {:select [:*], :from [:table], :where [:<=> nil :x 42]})
+  (sql/register-fn! :foo (fn [f args] ["FOO(?)" (first args)]))
+  (sql/format {:select [:*], :from [:table], :where [:foo 1 2 3]})
+  (defn- foo-formatter [f [x]]
+    (let [[sql & params] (sql/format-expr x)]
+      (into [(str (sql/sql-kw f) "(" sql ")")] params)))
+
+  (sql/register-fn! :foo foo-formatter)
+
+  (sql/format {:select [:*], :from [:table], :where [:foo [:+ :a 1]]})
+  ,)
+;;   This source contains code from
+;;   https://github.com/clojure/spec.alpha/blob/master/src/main/clojure/clojure/spec/alpha.clj
+;;   which is licensed as follows:
+
+;;   Copyright (c) Rich Hickey. All rights reserved.
+;;   The use and distribution terms for this software are covered by the
+;;   Eclipse Public License 1.0 (http://opensource.org/licenses/eclipse-1.0.php)
+;;   which can be found in the file epl-v10.html at the root of this distribution.
+;;   By using this software in any fashion, you are agreeing to be bound by
+;;   the terms of this license.
+;;   You must not remove this notice, or any other, from this software.
+
+(ns spartan.spec)
+
+(ns clojure.spec.gen.alpha)
+
+(ns clojure.spec.alpha ;; DANGER!
+  (:refer-clojure :exclude [+ * and assert or cat def keys merge])
+  (:require [clojure.walk :as walk]
+            [clojure.main :refer [demunge]]))
+
+;; 22
+(alias 'c 'clojure.core)
+
+;; 36
+(def ^:dynamic *coll-check-limit*
+  "The number of elements validated in a collection spec'ed with 'every'"
+  101)
+
+(def ^:dynamic *coll-error-limit*
+  "The number of errors reported by explain in a collection spec'ed with 'every'"
+  20)
+
+;; 52
+(defonce ^:private registry-ref (atom {}))
+
+;; 54
+(defn- deep-resolve [reg k]
+  (loop [spec k]
+    (if (ident? spec)
+      (recur (get reg spec))
+      spec)))
+
+;; 60
+(defn- reg-resolve
+  "returns the spec/regex at end of alias chain starting with k, nil if not found, k if k not ident"
+  [k]
+  (if (ident? k)
+    (let [reg @registry-ref
+          spec (get reg k)]
+      (if-not (ident? spec)
+        spec
+        (deep-resolve reg spec)))
+    k))
+
+;; 71
+(defn- reg-resolve!
+  "returns the spec/regex at end of alias chain starting with k, throws if not found, k if k not ident"
+  [k]
+  (if (ident? k)
+    (c/or (reg-resolve k)
+          (throw (Exception. (str "Unable to resolve spec: " k))))
+    k))
+
+;; 79
+(defn spec?
+  "returns x if x is a spec object, else logical false"
+  [x]
+  (when (identical? ::spec (:type x))
+    x))
+
+;; 85
+(defn regex?
+  [x]
+  (c/and (::op x) x))
+
+;; 90
+(defn- with-name [spec name]
+  (cond
+    (ident? spec) spec
+    (regex? spec) (assoc spec ::name name)
+    (instance? clojure.lang.IObj spec)
+    (with-meta spec (assoc (meta spec) ::name name))
+    :else spec))
+
+;; 98
+(defn- spec-name [spec]
+  (cond
+    (ident? spec) spec
+    (regex? spec) (::name spec)
+    (instance? clojure.lang.IObj spec)
+    (-> (meta spec) ::name)))
+
+;; 107
+(declare spec-impl)
+;; 108
+(declare regex-spec-impl)
+
+;; 110
+(defn- maybe-spec
+  "spec-or-k must be a spec, regex or resolvable kw/sym, else returns nil."
+  [spec-or-k]
+  (let [s (c/or (c/and (ident? spec-or-k) (reg-resolve spec-or-k))
+                (spec? spec-or-k)
+                (regex? spec-or-k)
+                nil)]
+    (if (regex? s)
+      (with-name (regex-spec-impl s nil) (spec-name s))
+      s)))
+
+;; 121
+(defn- the-spec
+  "spec-or-k must be a spec, regex or kw/sym, else returns nil. Throws if unresolvable kw/sym"
+  [spec-or-k]
+  (c/or
+   (maybe-spec spec-or-k)
+   (when (ident? spec-or-k)
+     (throw (Exception. (str "Unable to resolve spec: " spec-or-k))))))
+
+;; 131
+(defn- fn-sym [^Object f]
+  (let [[_ f-ns f-n] (re-matches #"(.*)\$(.*?)(__[0-9]+)?" (.. f getClass getName))]
+    ;; check for anonymous function
+    (when (not= "fn" f-n)
+      (symbol (demunge f-ns) (demunge f-n) #_(clojure.lang.Compiler/demunge f-ns) #_(clojure.lang.Compiler/demunge f-n)))))
+
+(defn specize*
+  ([x] (specize* x nil))
+  ([x form]
+   (cond (keyword? x) (specize* (reg-resolve! x))
+         (symbol? x) (specize* (reg-resolve! x))
+         (set? x) (spec-impl form x nil nil)
+         (regex? x) (spec-impl form x nil nil)
+         :else (if (c/and (not (map? x)) (ifn? x))
+                 (if-let [s (fn-sym x)]
+                   (spec-impl s x nil nil)
+                   (spec-impl ::unknown x nil nil))
+                 (spec-impl ::unknown x nil nil)))))
+
+;; 158
+(defn- specize
+  ([s]
+   (c/or (spec? s) (specize* s)))
+  ([s form]
+   (c/or (spec? s) (specize* s form))))
+
+;; 162
+(defn invalid?
+  "tests the validity of a conform return value"
+  [ret]
+  (identical? ::invalid ret))
+
+(declare re-conform)
+
+(defn conform* [spec x]
+  (cond (regex? spec)
+        (if (c/or (nil? x) (sequential? x))
+          (re-conform spec (seq x))
+          ::invalid)
+        (:cform spec)
+        ((:cform spec) spec x)
+        :else
+        (throw (ex-info "No conform function implemented yet."
+                        {:spec spec
+                         :x x}))))
+
+;; 167
+(defn conform
+  [spec x]
+  (conform* (specize spec) x))
+
+;; 173
+(declare op-unform)
+
+(defn unform* [spec x]
+  (cond (regex? spec)
+        (if (c/or (nil? x) (sequential? x))
+          (op-unform spec (seq x))
+          ::invalid)
+        (:unform spec)
+        ((:unform spec) spec x)
+        :else
+        (throw (ex-info "No unform function implemented yet."
+                 {:spec spec
+                  :x x}))))
+
+(defn unform
+  "Given a spec and a value created by or compliant with a call to
+  'conform' with the same spec, returns a value with all conform
+  destructuring undone."
+  [spec x]
+  (unform* (specize spec) x))
+
+(defn describe* [spec]
+  (if-let [d (:describe spec)]
+    (d spec)
+    (throw (ex-info "No describe function implemented yet."
+                    {:spec spec}))))
+
+;; 180
+(defn form
+  "returns the spec as data"
+  [spec]
+  ;;TODO - incorporate gens
+  (describe* (specize spec)))
+
+;; 186
+(defn abbrev [form]
+  (cond
+    (seq? form)
+    (walk/postwalk (fn [form]
+                     (cond
+                       (c/and (symbol? form) (namespace form))
+                       (-> form name symbol)
+
+                       (c/and (seq? form) (= 'fn (first form)) (= '[%] (second form)))
+                       (last form)
+                       :else form))
+                   form)
+
+    (c/and (symbol? form) (namespace form))
+    (-> form name symbol)
+    :else form))
+
+;; 205:
+(defn describe
+  "returns an abbreviated description of the spec as data"
+  [spec]
+  (abbrev (form spec)))
+
+;; 210:
+;; with-gen: TODO
+(defmacro with-gen [& _args]
+  (binding [*out* *err*]
+    (prn "WARNING: spartan.spec doesn't have with-gen yet" (assoc (meta &form) :file *file*))))
+
+(defn explain* [spec path via in x]
+  (let [{explain-f :explain} spec]
+    (if explain-f
+      (explain-f spec path via in x)
+      (throw (ex-info "No explain function implemented yet."
+                      {:spec spec
+                       :path path
+                       :via via
+                       :in :in
+                       :x x})))))
+
+;; 218:
+(defn explain-data* [spec path via in x]
+  (let [probs (explain* (specize spec) path via in x)]
+    (when-not (empty? probs)
+      {::problems probs
+       ::spec spec
+       ::value x})))
+
+;; 225:
+(defn explain-data
+  "Given a spec and a value x which ought to conform, returns nil if x
+  conforms, else a map with at least the key ::problems whose value is
+  a collection of problem-maps, where problem-map has at least :path :pred and :val
+  keys describing the predicate and the value that failed at that
+  path."
+  [spec x]
+  (explain-data* spec [] (if-let [name (spec-name spec)] [name] []) [] x))
+
+;; 234:
+(defn explain-printer
+  "Default printer for explain-data. nil indicates a successful validation."
+  [ed]
+  (if ed
+    (let [problems (->> (::problems ed)
+                        (sort-by #(- (count (:in %))))
+                        (sort-by #(- (count (:path %)))))]
+      (doseq [{:keys [path pred val reason via in] :as prob} problems]
+        (pr val)
+        (print " - failed: ")
+        (if reason (print reason) (pr (abbrev pred)))
+        (when-not (empty? in)
+          (print (str " in: " (pr-str in))))
+        (when-not (empty? path)
+          (print (str " at: " (pr-str path))))
+        (when-not (empty? via)
+          (print (str " spec: " (pr-str (last via)))))
+        (doseq [[k v] prob]
+          (when-not (#{:path :pred :val :reason :via :in} k)
+            (print "\n\t" (pr-str k) " ")
+            (pr v)))
+        (newline)))
+    (println "Success!")))
+
+;; 259:
+(def ^:dynamic *explain-out* explain-printer)
+
+;; 261:
+(defn explain-out
+  "Prints explanation data (per 'explain-data') to *out* using the printer in *explain-out*,
+   by default explain-printer."
+  [ed]
+  (*explain-out* ed))
+
+;; 267:
+(defn explain
+  "Given a spec and a value that fails to conform, prints an explanation to *out*."
+  [spec x]
+  (explain-out (explain-data spec x)))
+
+;; 272:
+(defn explain-str
+  "Given a spec and a value that fails to conform, returns an explanation as a string."
+  ^String [spec x]
+  (with-out-str (explain spec x)))
+
+;; 277
+(declare valid?)
+
+;; 279
+;; gensub-: TODO
+
+;; 292
+;; gen: TODO
+
+;; 305
+(defn- ->sym
+  "Returns a symbol from a symbol or var"
+  [x]
+  (cond (var? x)
+        (let [m (meta x)]
+          (symbol (str (ns-name (:ns m))) (str (:name m))))
+        (fn? x) (fn-sym x)
+        :else x))
+;; 314
+(defn- unfn [expr]
+  (if (c/and (seq? expr)
+             (symbol? (first expr))
+             (= "fn*" (name (first expr))))
+    (let [[[s] & form] (rest expr)]
+      (conj (walk/postwalk-replace {s '%} form) '[%] 'fn))
+    expr))
+
+;; 322
+(defn- res [form]
+  (cond
+    (keyword? form) form
+    (symbol? form) (c/or (-> form resolve ->sym) form)
+    (sequential? form) (walk/postwalk #(if (symbol? %) (res %) %) (unfn form))
+    :else form))
+
+;; 329
+(defn def-impl
+  "Do not call this directly, use 'def'"
+  [k form spec]
+  (c/assert (c/and (ident? k) (namespace k)) "k must be namespaced keyword or resolvable symbol")
+  (if (nil? spec)
+    (swap! registry-ref dissoc k)
+    (let [spec (if (c/or (spec? spec) (regex? spec) (get @registry-ref spec))
+                 spec
+                 (spec-impl form spec nil nil))]
+      (swap! registry-ref assoc k (with-name spec k))))
+  k)
+
+;; 341
+(defn- ns-qualify
+    "Qualify symbol s by resolving it or using the current *ns*."
+    [s]
+    (if-let [ns-sym (some-> s namespace symbol)]
+      (c/or (some-> (get (ns-aliases *ns*) ns-sym) str (symbol (name s)))
+                       s)
+      (symbol (str (ns-name *ns*)) (str s))))
+
+;; 349
+(defmacro def
+  "Given a namespace-qualified keyword or resolvable symbol k, and a
+  spec, spec-name, predicate or regex-op makes an entry in the
+  registry mapping k to the spec. Use nil to remove an entry in
+  the registry for k."
+  [k spec-form]
+  (let [k (if (symbol? k) (ns-qualify k) k)]
+    `(def-impl '~k '~(res spec-form) ~spec-form)))
+
+;; 358
+(defn registry
+  "returns the registry map, prefer 'get-spec' to lookup a spec by name"
+  []
+  @registry-ref)
+
+;; 363
+(defn get-spec
+  "Returns spec registered for keyword/symbol/var k, or nil."
+  [k]
+  (get (registry) (if (keyword? k) k (->sym k))))
+
+;; 368
+(defmacro spec
+  [form & {:keys [gen]}]
+  (when form
+    `(spec-impl '~(res form) ~form ~gen nil)))
+
+;; 387
+(defmacro multi-spec [mm retag]
+  `(multi-spec-impl ~mm ~retag))
+
+;; 416
+(defmacro keys
+  [& {:keys [req req-un opt opt-un gen]}]
+  (let [unk #(-> % name keyword)
+        req-keys (filterv keyword? (flatten req))
+        req-un-specs (filterv keyword? (flatten req-un))
+        _ (c/assert (every? #(c/and (keyword? %) (namespace %)) (concat req-keys req-un-specs opt opt-un))
+                               "all keys must be namespace-qualified keywords")
+        req-specs (into req-keys req-un-specs)
+        req-keys (into req-keys (map unk req-un-specs))
+        opt-keys (into (vec opt) (map unk opt-un))
+        opt-specs (into (vec opt) opt-un)
+        gx (gensym)
+        parse-req (fn [rk f]
+                    (map (fn [x]
+                           (if (keyword? x)
+                             `(contains? ~gx ~(f x))
+                             (walk/postwalk
+                              (fn [y] (if (keyword? y) `(contains? ~gx ~(f y)) y))
+                              x)))
+                         rk))
+        pred-exprs [`(map? ~gx)]
+        pred-exprs (into pred-exprs (parse-req req identity))
+        pred-exprs (into pred-exprs (parse-req req-un unk))
+        keys-pred `(fn* [~gx] (c/and ~@pred-exprs))
+        pred-exprs (mapv (fn [e] `(fn* [~gx] ~e)) pred-exprs)
+        pred-forms (walk/postwalk res pred-exprs)]
+    `(map-spec-impl {:req '~req :opt '~opt :req-un '~req-un :opt-un '~opt-un
+                     :req-keys '~req-keys :req-specs '~req-specs
+                     :opt-keys '~opt-keys :opt-specs '~opt-specs
+                     :pred-forms '~pred-forms
+                     :pred-exprs ~pred-exprs
+                     :keys-pred ~keys-pred
+                     :gfn ~gen})))
+
+;; 478
+(defmacro or
+  "Takes key+pred pairs, e.g.
+  (s/or :even even? :small #(< % 42))
+  Returns a destructuring spec that returns a map entry containing the
+  key of the first matching pred and the corresponding value. Thus the
+  'key' and 'val' functions can be used to refer generically to the
+  components of the tagged return."
+  [& key-pred-forms]
+  (let [pairs (partition 2 key-pred-forms)
+        keys (mapv first pairs)
+        pred-forms (mapv second pairs)
+        pf (mapv res pred-forms)]
+    (c/assert (c/and (even? (count key-pred-forms)) (every? keyword? keys)) "spec/or expects k1 p1 k2 p2..., where ks are keywords")
+    `(or-spec-impl ~keys '~pf ~pred-forms)))
+
+;; 495
+(defmacro and
+  "Takes predicate/spec-forms, e.g.
+  (s/and even? #(< % 42))
+  Returns a spec that returns the conformed value. Successive
+  conformed values propagate through rest of predicates."
+  [& pred-forms]
+  `(and-spec-impl '~(mapv res pred-forms) ~(vec pred-forms)))
+
+;; 505
+(defmacro merge
+  "Takes map-validating specs (e.g. 'keys' specs) and
+  returns a spec that returns a conformed map satisfying all of the
+  specs.  Unlike 'and', merge can generate maps satisfying the
+  union of the predicates."
+  [& pred-forms]
+  `(merge-spec-impl '~(mapv res pred-forms) ~(vec pred-forms) nil))
+
+;; 513
+(defn- res-kind
+  [opts]
+  (let [{kind :kind :as mopts} opts]
+    (->>
+     (if kind
+       (assoc mopts :kind `~(res kind))
+       mopts)
+     (mapcat identity))))
+
+;; 522
+(defmacro every
+  [pred & {:keys [into kind count max-count min-count distinct gen-max gen] :as opts}]
+  (let [desc (::describe opts)
+        nopts (-> opts
+                  (dissoc :gen ::describe)
+                  (assoc ::kind-form `'~(res (:kind opts))
+                         ::describe (c/or desc `'(every ~(res pred) ~@(res-kind opts)))))
+        gx (gensym)
+        cpreds (cond-> [(list (c/or kind `coll?) gx)]
+                 count (conj `(= ~count (bounded-count ~count ~gx)))
+
+                 (c/or min-count max-count)
+                 (conj `(<= (c/or ~min-count 0)
+                            (bounded-count (if ~max-count (inc ~max-count) ~min-count) ~gx)
+                            (c/or ~max-count Integer/MAX_VALUE)))
+
+                 distinct
+                 (conj `(c/or (empty? ~gx) (apply distinct? ~gx))))]
+    `(every-impl '~pred ~pred ~(assoc nopts ::cpred `(fn* [~gx] (c/and ~@cpreds))) ~gen)))
+
+;; 570
+(defmacro every-kv
+  "like 'every' but takes separate key and val preds and works on associative collections.
+  Same options as 'every', :into defaults to {}
+  See also - map-of"
+
+  [kpred vpred & opts]
+  (let [desc `(every-kv ~(res kpred) ~(res vpred) ~@(res-kind opts))]
+    `(every (tuple ~kpred ~vpred) ::kfn (fn [i# v#] (nth v# 0)) :into {} ::describe '~desc ~@opts)))
+
+;; 581
+(defmacro coll-of
+  "Returns a spec for a collection of items satisfying pred. Unlike
+  'every', coll-of will exhaustively conform every value.
+  Same options as 'every'. conform will produce a collection
+  corresponding to :into if supplied, else will match the input collection,
+  avoiding rebuilding when possible.
+  See also - every, map-of"
+  [pred & opts]
+  (let [desc `(coll-of ~(res pred) ~@(res-kind opts))]
+    `(every ~pred ::conform-all true ::describe '~desc ~@opts)))
+
+;; 594
+(defmacro map-of
+  "Returns a spec for a map whose keys satisfy kpred and vals satisfy
+  vpred. Unlike 'every-kv', map-of will exhaustively conform every
+  value.
+  Same options as 'every', :kind defaults to map?, with the addition of:
+  :conform-keys - conform keys as well as values (default false)
+  See also - every-kv"
+  [kpred vpred & opts]
+  (let [desc `(map-of ~(res kpred) ~(res vpred) ~@(res-kind opts))]
+    `(every-kv ~kpred ~vpred ::conform-all true :kind map? ::describe '~desc ~@opts)))
+
+;; 609
+(defmacro *
+  "Returns a regex op that matches zero or more values matching
+  pred. Produces a vector of matches iff there is at least one match"
+  [pred-form]
+  `(rep-impl '~(res pred-form) ~pred-form))
+
+;; 615
+(defmacro +
+  "Returns a regex op that matches one or more values matching
+  pred. Produces a vector of matches"
+  [pred-form]
+  `(rep+impl '~(res pred-form) ~pred-form))
+
+;; 621
+(defmacro ?
+  "Returns a regex op that matches zero or one value matching
+  pred. Produces a single value (not a collection) if matched."
+  [pred-form]
+  `(maybe-impl ~pred-form '~(res pred-form)))
+
+;; 627
+(defmacro alt
+  "Takes key+pred pairs, e.g.
+  (s/alt :even even? :small #(< % 42))
+  Returns a regex op that returns a map entry containing the key of the
+  first matching pred and the corresponding value. Thus the
+  'key' and 'val' functions can be used to refer generically to the
+  components of the tagged return"
+  [& key-pred-forms]
+  (let [pairs (partition 2 key-pred-forms)
+        keys (mapv first pairs)
+        pred-forms (mapv second pairs)
+        pf (mapv res pred-forms)]
+    (c/assert (c/and (even? (count key-pred-forms)) (every? keyword? keys)) "alt expects k1 p1 k2 p2..., where ks are keywords")
+    `(alt-impl ~keys ~pred-forms '~pf)))
+
+;; 644
+(defmacro cat
+  "Takes key+pred pairs, e.g.
+  (s/cat :e even? :o odd?)
+  Returns a regex op that matches (all) values in sequence, returning a map
+  containing the keys of each pred and the corresponding value."
+  [& key-pred-forms]
+  ;; (prn key-pred-forms) ;; ok
+  (let [pairs (partition 2 key-pred-forms)
+        keys (mapv first pairs)
+        pred-forms (mapv second pairs)
+        pf (mapv res pred-forms)]
+    (c/assert (c/and (even? (count key-pred-forms)) (every? keyword? keys)) "cat expects k1 p1 k2 p2..., where ks are keywords")
+    ;; (prn "pf" pf) ;; too soon
+    `(cat-impl ~keys ~pred-forms '~pf)))
+
+;; 660
+(defmacro &
+  "takes a regex op re, and predicates. Returns a regex-op that consumes
+  input as per re but subjects the resulting value to the
+  conjunction of the predicates, and any conforming they might perform."
+  [re & preds]
+  (let [pv (vec preds)]
+    `(amp-impl ~re '~(res re) ~pv '~(mapv res pv))))
+
+;; 668
+(defmacro conformer
+  "takes a predicate function with the semantics of conform i.e. it should return either a
+  (possibly converted) value or :clojure.spec.alpha/invalid, and returns a
+  spec that uses it as a predicate/conformer. Optionally takes a
+  second fn that does unform of result of first"
+  ([f] `(spec-impl '(conformer ~(res f)) ~f nil true))
+  ([f unf] `(spec-impl '(conformer ~(res f) ~(res unf)) ~f nil true ~unf)))
+
+;; 676
+(defmacro fspec
+  "takes :args :ret and (optional) :fn kwargs whose values are preds
+  and returns a spec whose conform/explain take a fn and validates it
+  using generative testing. The conformed value is always the fn itself.
+  See 'fdef' for a single operation that creates an fspec and
+  registers it, as well as a full description of :args, :ret and :fn
+  fspecs can generate functions that validate the arguments and
+  fabricate a return value compliant with the :ret spec, ignoring
+  the :fn spec if present.
+  Optionally takes :gen generator-fn, which must be a fn of no args
+  that returns a test.check generator."
+  [& {:keys [args ret fn gen] :or {ret `any?}}]
+  `(fspec-impl (spec ~args) '~(res args)
+               (spec ~ret) '~(res ret)
+               (spec ~fn) '~(res fn) ~gen))
+
+;; 696
+(defmacro tuple
+  "takes one or more preds and returns a spec for a tuple, a vector
+  where each element conforms to the corresponding pred. Each element
+  will be referred to in paths using its ordinal."
+  [& preds]
+  (c/assert (seq preds))
+  `(tuple-impl '~(mapv res preds) ~(vec preds)))
+
+;; 704:
+;; macroexpand-check: TODO
+
+;; 716:
+(defmacro fdef
+  [fn-sym & specs]
+  `(clojure.spec.alpha/def ~fn-sym (clojure.spec.alpha/fspec ~@specs)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; impl ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; 759
+(defn- dt
+  ([pred x form] (dt pred x form nil))
+  ([pred x form cpred?]
+   (if pred
+     (if-let [spec (the-spec pred)]
+       (conform spec x)
+       (if (ifn? pred)
+         (if cpred?
+           (pred x)
+           (if (pred x) x ::invalid))
+         (throw (Exception. (str (pr-str form) " is not a fn, expected predicate fn")))))
+     x)))
+
+;; 772
+(defn valid?
+  "Helper function that returns true when x is valid for spec."
+  ([spec x]
+   (let [spec (specize spec)]
+     (not (invalid? (conform* spec x)))))
+  ([spec x form]
+   (let [spec (specize spec form)]
+     (not (invalid? (conform* spec x))))))
+
+;; 781
+(defn- pvalid?
+  "internal helper function that returns true when x is valid for spec."
+  ([pred x]
+   (not (invalid? (dt pred x ::unknown))))
+  ([pred x form]
+   (not (invalid? (dt pred x form)))))
+
+;; 788
+(defn- explain-1 [form pred path via in v]
+  ;;(prn {:form form :pred pred :path path :in in :v v})
+  (let [pred (maybe-spec pred)]
+    (if (spec? pred)
+      (explain* pred path (if-let [name (spec-name pred)] (conj via name) via) in v)
+      [{:path path :pred form :val v :via via :in in}])))
+
+;; 842
+(defn map-spec-impl
+  "Do not call this directly, use 'spec' with a map argument"
+  [{:keys [req-un opt-un keys-pred pred-exprs opt-keys req-specs req req-keys opt-specs pred-forms opt gfn]
+    :as argm}]
+  (let [k->s (zipmap (concat req-keys opt-keys) (concat req-specs opt-specs))
+        keys->specnames #(c/or (k->s %) %)
+        id (java.util.UUID/randomUUID)]
+    {:type ::spec
+     :id id
+     :cform  (fn [_ m]
+               (if (keys-pred m)
+                 (let [reg (registry)]
+                   (loop [ret m, [[k v] & ks :as keys] m]
+                     (if keys
+                       (let [sname (keys->specnames k)]
+                         (if-let [s (get reg sname)]
+                           (let [cv (conform s v)]
+                             (if (invalid? cv)
+                               ::invalid
+                               (recur (if (identical? cv v) ret (assoc ret k cv))
+                                      ks)))
+                           (recur ret ks)))
+                       ret)))
+                 ::invalid))
+     :unform  (fn [_ m]
+                (let [reg (registry)]
+                  (loop [ret m, [k & ks :as keys] (c/keys m)]
+                    (if keys
+                      (if (contains? reg (keys->specnames k))
+                        (let [cv (get m k)
+                              v (unform (keys->specnames k) cv)]
+                          (recur (if (identical? cv v) ret (assoc ret k v))
+                            ks))
+                        (recur ret ks))
+                      ret))))
+     :explain (fn [_ path via in x]
+               (if-not (map? x)
+                 [{:path path :pred `map? :val x :via via :in in}]
+                 (let [reg (registry)]
+                   (apply concat
+                          (when-let [probs (->> (map (fn [pred form] (when-not (pred x) form))
+                                                     pred-exprs pred-forms)
+                                                (keep identity)
+                                                seq)]
+                            (map
+                             #(identity {:path path :pred % :val x :via via :in in})
+                             probs))
+                          (map (fn [[k v]]
+                                 (when-not (c/or (not (contains? reg (keys->specnames k)))
+                                                            (pvalid? (keys->specnames k) v k))
+                                   (explain-1 (keys->specnames k) (keys->specnames k) (conj path k) via (conj in k) v)))
+                               (seq x))))))
+     :describe (fn [_] (cons `keys
+                             (cond-> []
+                               req (conj :req req)
+                               opt (conj :opt opt)
+                               req-un (conj :req-un req-un)
+                               opt-un (conj :opt-un opt-un))))}))
+
+;; 915
+(defn ^:skip-wiki spec-impl
+  "Do not call this directly, use 'spec'"
+  ([form pred gfn cpred?] (spec-impl form pred gfn cpred? nil))
+  ([form pred gfn cpred? unc]
+     (cond
+      (spec? pred) pred ;; (cond-> pred gfn (with-gen gfn))
+      (regex? pred) (regex-spec-impl pred gfn)
+      (ident? pred) (the-spec pred) #_(cond-> (the-spec pred) gfn (with-gen gfn))
+      :else
+      {:type ::spec
+       :form form
+       :cform (fn [_ x] (let [ret (pred x)]
+                          (if cpred?
+                            ret
+                            (if ret x ::invalid))))
+       :unform (fn [_ x]
+                 (if cpred?
+                   (if unc
+                     (unc x)
+                     (throw (Exception. "no unform fn for conformer")))
+                   x))
+       :explain (fn [_ path via in x]
+                  (when (invalid? (dt pred x form cpred?))
+                    [{:path path :pred form :val x :via via :in in}]))
+       :describe (fn [_] form)})))
+;;; 948
+(defn multi-spec-impl [mm retag]
+  (let [id (gensym)
+        predx #(let [mm mm]
+                 (mm %))]
+    {:type   ::spec
+     :cform  (fn [_ x]
+               (if-let [pred (predx x)]
+                 (dt pred x nil #_form)
+                 ::invalid))
+     :unform (fn [_ x]
+               (if-let [pred (predx x)]
+                         (unform pred x)
+                         (throw (Exception. (str "No method of: " form " for dispatch value: " #_ (dval x))))))}))
+;; 998
+(defn ^:skip-wiki tuple-impl
+  "Do not call this directly, use 'tuple'"
+  ([forms preds] (tuple-impl forms preds nil))
+  ([forms preds gfn]
+     (let [specs (delay (mapv specize preds forms))
+           cnt (count preds)]
+       {:type ::spec
+        :cform (fn [_ x]
+                 (let [specs @specs]
+                   (if-not (c/and (vector? x)
+                                             (= (count x) cnt))
+                     ::invalid
+                     (loop [ret x, i 0]
+                       (if (= i cnt)
+                         ret
+                         (let [v (x i)
+                               cv (conform* (specs i) v)]
+                           (if (invalid? cv)
+                             ::invalid
+                             (recur (if (identical? cv v) ret (assoc ret i cv))
+                                    (inc i)))))))))
+        :unform (fn [_ x]
+                  (c/assert (c/and (vector? x)
+                                   (= (count x) (count preds))))
+                  (loop [ret x, i 0]
+                    (if (= i (count x))
+                      ret
+                      (let [cv (x i)
+                            v (unform (preds i) cv)]
+                        (recur (if (identical? cv v) ret (assoc ret i v))
+                          (inc i))))))
+        :explain (fn [_ path via in x]
+                   (cond
+                     (not (vector? x))
+                     [{:path path :pred `vector? :val x :via via :in in}]
+
+                     (not= (count x) (count preds))
+                     [{:path path :pred `(= (count ~'%) ~(count preds)) :val x :via via :in in}]
+
+                     :else
+                     (apply concat
+                            (map (fn [i form pred]
+                                   (let [v (x i)]
+                                     (when-not (pvalid? pred v)
+                                       (explain-1 form pred (conj path i) via (conj in i) v))))
+                                 (range (count preds)) forms preds))))})))
+
+;; 1060
+(defn- tagged-ret [tag ret]
+  (clojure.lang.MapEntry. tag ret))
+
+;; 1063
+(defn or-spec-impl
+  [keys forms preds]
+  (let [id (java.util.UUID/randomUUID)
+        kps (zipmap keys preds)
+        specs (delay (mapv specize preds forms))
+        cform (case (count preds)
+                2 (fn [x]
+                    (let [ret  (let [specs @specs
+                                    ret (conform* (specs 0) x)]
+                                (if (invalid? ret)
+                                  (let [ret (conform* (specs 1) x)]
+                                    (if (invalid? ret)
+                                      ::invalid
+                                      (tagged-ret (keys 1) ret)))
+                                  (tagged-ret (keys 0) ret)))]
+                      ret))
+                3 (fn [x]
+                    (let [specs @specs
+                          ret (conform* (specs 0) x)]
+                      (if (invalid? ret)
+                        (let [ret (conform* (specs 1) x)]
+                          (if (invalid? ret)
+                            (let [ret (conform* (specs 2) x)]
+                              (if (invalid? ret)
+                                ::invalid
+                                (tagged-ret (keys 2) ret)))
+                            (tagged-ret (keys 1) ret)))
+                        (tagged-ret (keys 0) ret))))
+                (fn [x]
+                  (let [specs @specs]
+                    (loop [i 0]
+                      (if (< i (count specs))
+                        (let [spec (specs i)]
+                          (let [ret (conform* spec x)]
+                            (if (invalid? ret)
+                              (recur (inc i))
+                              (tagged-ret (keys i) ret))))
+                        ::invalid)))))]
+    {:type ::spec
+     :id id
+     :cform (fn [_ x] (cform x))
+     :unform (fn [_ [k x]] (unform (kps k) x))
+     :explain (fn [this path via in x]
+                (when-not (pvalid? this x)
+                  (apply concat
+                         (map (fn [k form pred]
+                                (when-not (pvalid? pred x)
+                                  (explain-1 form pred (conj path k) via in x)))
+                              keys forms preds))))
+     :describe (fn [_] `(or ~@(mapcat vector keys forms)))}))
+
+;; 1130
+(defn- and-preds [x preds forms]
+  (loop [ret x
+         [pred & preds] preds
+         [form & forms] forms]
+    (if pred
+      (let [nret (dt pred ret form)]
+        (if (invalid? nret)
+          ::invalid
+          ;;propagate conformed values
+          (recur nret preds forms)))
+      ret)))
+
+;; 1142
+(defn- explain-pred-list
+  [forms preds path via in x]
+  (loop [ret x
+         [form & forms] forms
+         [pred & preds] preds]
+    (when pred
+      (let [nret (dt pred ret form)]
+        (if (invalid? nret)
+          (explain-1 form pred path via in ret)
+          (recur nret forms preds))))))
+
+;; 1153
+(defn ^:skip-wiki and-spec-impl
+  "Do not call this directly, use 'and'"
+  [forms preds]
+  (let [specs (delay (mapv specize preds forms))
+        cform
+        (case (count preds)
+              2 (fn [x]
+                  (let [specs @specs
+                        ret (conform* (specs 0) x)]
+                    (if (invalid? ret)
+                      ::invalid
+                      (conform* (specs 1) ret))))
+              3 (fn [x]
+                  (let [specs @specs
+                        ret (conform* (specs 0) x)]
+                    (if (invalid? ret)
+                      ::invalid
+                      (let [ret (conform* (specs 1) ret)]
+                        (if (invalid? ret)
+                          ::invalid
+                          (conform* (specs 2) ret))))))
+              (fn [x]
+                (let [specs @specs]
+                  (loop [ret x i 0]
+                    (if (< i (count specs))
+                      (let [nret (conform* (specs i) ret)]
+                        (if (invalid? nret)
+                          ::invalid
+                          ;;propagate conformed values
+                          (recur nret (inc i))))
+                      ret)))))]
+    {:type ::spec
+     :cform (fn [_ x] (cform x))
+     :unform (fn [_ x] (reduce #(unform %2 %1) x (reverse preds)))
+     :explain (fn [_ path via in x] (explain-pred-list forms preds path via in x))
+     :describe (fn [_] `(and ~@forms))}))
+
+;; 1197
+(defn ^:skip-wiki merge-spec-impl
+  "Do not call this directly, use 'merge'"
+  [forms preds gfn]
+  {:type ::spec
+   :cform (fn [_ x] (let [ms (map #(dt %1 x %2) preds forms)]
+                      (if (some invalid? ms)
+                        ::invalid
+                        (apply c/merge ms))))
+   :unform (fn [_ x] (apply c/merge (map #(unform % x) (reverse preds))))
+   :explain (fn [_ path via in x]
+              (apply concat
+                     (map #(explain-1 %1 %2 path via in x)
+                          forms preds)))
+   :describe (fn [_] `(merge ~@forms))})
+
+;; 1255
+(defn- coll-prob [x kfn kform distinct count min-count max-count
+                  path via in]
+  (let [pred (c/or kfn coll?)
+        kform (c/or kform `coll?)]
+    (cond
+      (not (pvalid? pred x))
+      (explain-1 kform pred path via in x)
+
+      (c/and count (not= count (bounded-count count x)))
+      [{:path path :pred `(= ~count (c/count ~'%)) :val x :via via :in in}]
+
+      (c/and (c/or min-count max-count)
+             (not (<= (c/or min-count 0)
+                      (bounded-count (if max-count (inc max-count) min-count) x)
+                      (c/or max-count Integer/MAX_VALUE))))
+      [{:path path :pred `(<= ~(c/or min-count 0) (c/count ~'%) ~(c/or max-count 'Integer/MAX_VALUE)) :val x :via via :in in}]
+      (c/and distinct (seq x) (not (apply distinct? x)))
+      [{:path path :pred 'distinct? :val x :via via :in in}])))
+
+;; 1245
+(def ^:private empty-coll {`vector? [], `set? #{}, `list? (), `map? {}})
+
+;; 1247
+(defn every-impl
+  "Do not call this directly, use 'every', 'every-kv', 'coll-of' or 'map-of'"
+  ([form pred opts] (every-impl form pred opts nil))
+  ([form pred {conform-into :into
+               describe-form ::describe
+               :keys [kind ::kind-form count max-count min-count distinct gen-max ::kfn ::cpred
+                      conform-keys ::conform-all]
+               :or {gen-max 20}
+               :as opts}
+    gfn]
+     (let [;; gen-into (if conform-into (empty conform-into) (get empty-coll kind-form))
+           spec (delay (specize pred))
+           check? #(valid? @spec %)
+           kfn (c/or kfn (fn [i v] i))
+           addcv (fn [ret i v cv] (conj ret cv))
+           cfns (fn [x]
+                  ;;returns a tuple of [init add complete] fns
+                  (cond
+                   (c/and (vector? x) (c/or (not conform-into) (vector? conform-into)))
+                   [identity
+                    (fn [ret i v cv]
+                      (if (identical? v cv)
+                        ret
+                        (assoc ret i cv)))
+                    identity]
+
+                   (c/and (map? x) (c/or (c/and kind (not conform-into)) (map? conform-into)))
+                   [(if conform-keys empty identity)
+                    (fn [ret i v cv]
+                      (if (c/and (identical? v cv) (not conform-keys))
+                        ret
+                        (assoc ret (nth (if conform-keys cv v) 0) (nth cv 1))))
+                    identity]
+
+                   (c/or (list? conform-into) (seq? conform-into) (c/and (not conform-into) (c/or (list? x) (seq? x))))
+                   [(constantly ()) addcv reverse]
+
+                   :else [#(empty (c/or conform-into %)) addcv identity]))]
+       {:type ::spec
+        :cform (fn [_ x]
+                 (let [spec @spec]
+                   (cond
+                     (not (cpred x)) ::invalid
+
+                     conform-all
+                     (let [[init add complete] (cfns x)]
+                       (loop [ret (init x), i 0, [v & vs :as vseq] (seq x)]
+                         (if vseq
+                           (let [cv (conform* spec v)]
+                             (if (invalid? cv)
+                               ::invalid
+                               (recur (add ret i v cv) (inc i) vs)))
+                           (complete ret))))
+                     :else
+                     (if (indexed? x)
+                       (let [step (max 1 (long (/ (c/count x) *coll-check-limit*)))]
+                         (loop [i 0]
+                           (if (>= i (c/count x))
+                             x
+                             (if (valid? spec (nth x i))
+                               (recur (c/+ i step))
+                               ::invalid))))
+                       (let [limit *coll-check-limit*]
+                         (loop [i 0 [v & vs :as vseq] (seq x)]
+                           (cond
+                             (c/or (nil? vseq) (= i limit)) x
+                             (valid? spec v) (recur (inc i) vs)
+                             :else ::invalid)))))))
+        :unform (fn [_ x]
+                  (if conform-all
+                    (let [spec @spec
+                          [init add complete] (cfns x)]
+                      (loop [ret (init x), i 0, [v & vs :as vseq] (seq x)]
+                        (if (>= i (c/count x))
+                          (complete ret)
+                          (recur (add ret i v (unform* spec v)) (inc i) vs))))
+                    x))
+        :explain (fn [_ path via in x]
+                   (c/or (coll-prob x kind kind-form distinct count min-count max-count
+                                               path via in)
+                                    (apply concat
+                                           ((if conform-all identity (partial take *coll-error-limit*))
+                                            (keep identity
+                                                  (map (fn [i v]
+                                                         (let [k (kfn i v)]
+                                                           (when-not (check? v)
+                                                             (let [prob (explain-1 form pred path via (conj in k) v)]
+                                                               prob))))
+                                                       (range) x))))))
+        :describe (fn [_] (c/or describe-form `(every ~(res form) ~@(mapcat identity opts))))})))
+
+
+;; 1382
+(defn- accept [x] {::op ::accept :ret x})
+
+;; 1384
+(defn- accept? [{:keys [::op]}]
+  (= ::accept op))
+
+;; 1387
+(defn- pcat* [{[p1 & pr :as ps] :ps,  [k1 & kr :as ks] :ks, [f1 & fr :as forms] :forms, ret :ret, rep+ :rep+}]
+  (when (every? identity ps)
+    (if (accept? p1)
+      (let [rp (:ret p1)
+            ret (conj ret (if ks {k1 rp} rp))]
+        (if pr
+          (pcat* {:ps pr :ks kr :forms fr :ret ret})
+          (accept ret)))
+      {::op ::pcat, :ps ps, :ret ret, :ks ks, :forms forms :rep+ rep+})))
+
+;; 1379
+(defn- pcat [& ps] (pcat* {:ps ps :ret []}))
+
+;; 1399
+(defn cat-impl
+  "Do not call this directly, use 'cat'"
+  [ks ps forms]
+  (pcat* {:ks ks, :ps ps, :forms forms, :ret {}}))
+
+;; 1404
+(defn- rep* [p1 p2 ret splice form]
+  (when p1
+    (let [r {::op ::rep, :p2 p2, :splice splice, :forms form :id (java.util.UUID/randomUUID)}]
+      (if (accept? p1)
+        (assoc r :p1 p2 :ret (conj ret (:ret p1)))
+        (assoc r :p1 p1, :ret ret)))))
+
+;; 1411
+(defn rep-impl
+  [form p] (rep* p p [] false form))
+
+;; 1415
+(defn rep+impl
+  [form p]
+  (pcat* {:ps [p (rep* p p [] true form)] :forms `[~form (* ~form)] :ret [] :rep+ form}))
+
+;; 1420
+(defn amp-impl
+  [re re-form preds pred-forms]
+  {::op ::amp :p1 re :amp re-form :ps preds :forms pred-forms})
+
+;; 1425
+(defn- filter-alt [ps ks forms f]
+  (if (c/or ks forms)
+    (let [pks (->> (map vector ps
+                        (c/or (seq ks) (repeat nil))
+                        (c/or (seq forms) (repeat nil)))
+                   (filter #(-> % first f)))]
+      [(seq (map first pks)) (when ks (seq (map second pks))) (when forms (seq (map #(nth % 2) pks)))])
+    [(seq (filter f ps)) ks forms]))
+
+;; 1434
+(defn- alt* [ps ks forms]
+  (let [[[p1 & pr :as ps] [k1 :as ks] forms] (filter-alt ps ks forms identity)]
+    (when ps
+      (let [ret {::op ::alt, :ps ps, :ks ks :forms forms}]
+        (if (nil? pr)
+          (if k1
+            (if (accept? p1)
+              (accept (tagged-ret k1 (:ret p1)))
+              ret)
+            p1)
+          ret)))))
+
+;; 1446
+(defn- alts [& ps] (alt* ps nil nil))
+;; 1447
+(defn- alt2 [p1 p2] (if (c/and p1 p2) (alts p1 p2) (c/or p1 p2)))
+
+;; 1449
+(defn alt-impl
+  "Do not call this directly, use 'alt'"
+  [ks ps forms] (assoc (alt* ps ks forms) :id (java.util.UUID/randomUUID)))
+
+;; 1453
+(defn maybe-impl
+  [p form] (assoc (alt* [p (accept ::nil)] nil [form ::nil]) :maybe form))
+
+;; 1457
+(defn- noret? [p1 pret]
+  (c/or (= pret ::nil)
+                   (c/and (#{::rep ::pcat} (::op (reg-resolve! p1))) ;;hrm, shouldn't know these
+                                     (empty? pret))
+                   nil))
+
+;; 1463
+(declare preturn)
+
+;; 1465
+(defn- accept-nil? [p]
+  (let [{:keys [::op ps p1 p2 forms] :as p} (reg-resolve! p)]
+    (case op
+      ::accept true
+      nil nil
+      ::amp (c/and (accept-nil? p1)
+                              (let [ret (-> (preturn p1) (and-preds ps (next forms)))]
+                                (not (invalid? ret))))
+      ::rep (c/or (identical? p1 p2) (accept-nil? p1))
+      ::pcat (every? accept-nil? ps)
+      ::alt (c/some accept-nil? ps))))
+
+;; 1477
+(declare add-ret)
+
+(defn- and-preds [x preds forms]
+  (loop [ret x
+         [pred & preds] preds
+         [form & forms] forms]
+    (if pred
+      (let [nret (dt pred ret form)]
+        (if (invalid? nret)
+          ::invalid
+          ;;propagate conformed values
+          (recur nret preds forms)))
+      ret)))
+
+;; 1479
+(defn- preturn [p]
+  (let [{[p0 & pr :as ps] :ps, [k :as ks] :ks, :keys [::op p1 ret forms] :as p} (reg-resolve! p)]
+    (case op
+      ::accept ret
+      nil nil
+      ::amp (let [pret (preturn p1)]
+              (if (noret? p1 pret)
+                ::nil
+                (and-preds pret ps forms)))
+      ::rep (add-ret p1 ret k)
+      ::pcat (add-ret p0 ret k)
+      ::alt (let [[[p0] [k0]] (filter-alt ps ks forms accept-nil?)
+                  r (if (nil? p0) ::nil (preturn p0))]
+              (if k0 (tagged-ret k0 r) r)))))
+
+; 1487
+(defn- op-unform [p x]
+  ;;(prn {:p p :x x})
+  (let [{[p0 & pr :as ps] :ps, [k :as ks] :ks, :keys [::op p1 ret forms rep+ maybe] :as p} (reg-resolve! p)
+        kps (zipmap ks ps)]
+    (case op
+      ::accept [ret]
+      nil [(unform p x)]
+      ::amp (let [px (reduce #(unform %2 %1) x (reverse ps))]
+              (op-unform p1 px))
+      ::rep (mapcat #(op-unform p1 %) x)
+      ::pcat (if rep+
+               (mapcat #(op-unform p0 %) x)
+               (mapcat (fn [k]
+                         (when (contains? x k)
+                           (op-unform (kps k) (get x k))))
+                 ks))
+      ::alt (if maybe
+              [(unform p0 x)]
+              (let [[k v] x]
+                (op-unform (kps k) v))))))
+
+;; 1515
+(defn- add-ret [p r k]
+  (let [{:keys [::op ps splice] :as p} (reg-resolve! p)
+        prop #(let [ret (preturn p)]
+                (if (empty? ret) r ((if splice into conj) r (if k {k ret} ret))))]
+    (case op
+        nil r
+        (::alt ::accept ::amp)
+        (let [ret (preturn p)]
+          ;;(prn {:ret ret})
+          (if (= ret ::nil) r (conj r (if k {k ret} ret))))
+
+        (::rep ::pcat) (prop))))
+
+;; 1528
+(defn- deriv
+  [p x]
+  (let [{[p0 & pr :as ps] :ps, [k0 & kr :as ks] :ks, :keys [::op p1 p2 ret splice forms amp] :as p} (reg-resolve! p)]
+    (when p
+      (case op
+        ::accept nil
+        nil (let [ret (dt p x p)]
+              (when-not (invalid? ret) (accept ret)))
+        ::amp (when-let [p1 (deriv p1 x)]
+                (if (= ::accept (::op p1))
+                  (let [ret (-> (preturn p1) (and-preds ps (next forms)))]
+                    (when-not (invalid? ret)
+                      (accept ret)))
+                  (amp-impl p1 amp ps forms)))
+        ::pcat (alt2 (pcat* {:ps (cons (deriv p0 x) pr), :ks ks, :forms forms, :ret ret})
+                     (when (accept-nil? p0) (deriv (pcat* {:ps pr, :ks kr, :forms (next forms), :ret (add-ret p0 ret k0)}) x)))
+        ::alt (alt* (map #(deriv % x) ps) ks forms)
+        ::rep (alt2 (rep* (deriv p1 x) p2 ret splice forms)
+                    (when (accept-nil? p1) (deriv (rep* p2 p2 (add-ret p1 ret nil) splice forms) x)))))))
+
+;; 1548
+(defn- op-describe [p]
+  (let [{:keys [::op ps ks forms splice p1 rep+ maybe amp] :as p} (reg-resolve! p)]
+    ;;(prn {:op op :ks ks :forms forms :p p})
+    (when p
+      (case op
+        ::accept nil
+        nil p
+        ::amp (list* 'clojure.spec.alpha/& amp forms)
+        ::pcat (if rep+
+                 (list `+ rep+)
+                 (cons `cat (mapcat vector (c/or (seq ks) (repeat :_)) forms)))
+        ::alt (if maybe
+                (list `? maybe)
+                (cons `alt (mapcat vector ks forms)))
+        ::rep (list (if splice `+ `*) forms)))))
+
+;; 1564
+(defn- op-explain [form p path via in input]
+  ;;(prn {:form form :p p :path path :input input})
+  (let [[x :as input] input
+        {:keys [::op ps ks forms splice p1 p2] :as p} (reg-resolve! p)
+        via (if-let [name (spec-name p)] (conj via name) via)
+        insufficient (fn [path form]
+                       [{:path path
+                         :reason "Insufficient input"
+                         :pred form
+                         :val ()
+                         :via via
+                         :in in}])]
+    (when p
+      (case op
+            ::accept nil
+            nil (if (empty? input)
+                  (insufficient path form)
+                  (explain-1 form p path via in x))
+            ::amp (if (empty? input)
+                    (if (accept-nil? p1)
+                      (explain-pred-list forms ps path via in (preturn p1))
+                      (insufficient path (:amp p)))
+                    (if-let [p1 (deriv p1 x)]
+                      (explain-pred-list forms ps path via in (preturn p1))
+                      (op-explain (:amp p) p1 path via in input)))
+            ::pcat (let [pkfs (map vector
+                                   ps
+                                   (c/or (seq ks) (repeat nil))
+                                   (c/or (seq forms) (repeat nil)))
+                         [pred k form] (if (= 1 (count pkfs))
+                                         (first pkfs)
+                                         (first (remove (fn [[p]] (accept-nil? p)) pkfs)))
+                         path (if k (conj path k) path)
+                         form (c/or form (op-describe pred))]
+                     (if (c/and (empty? input) (not pred))
+                       (insufficient path form)
+                       (op-explain form pred path via in input)))
+            ::alt (if (empty? input)
+                    (insufficient path (op-describe p))
+                    (apply concat
+                           (map (fn [k form pred]
+                                  (op-explain (c/or form (op-describe pred))
+                                              pred
+                                              (if k (conj path k) path)
+                                              via
+                                              in
+                                              input))
+                                (c/or (seq ks) (repeat nil))
+                                (c/or (seq forms) (repeat nil))
+                                ps)))
+            ::rep (op-explain (if (identical? p1 p2)
+                                forms
+                                (op-describe p1))
+                              p1 path via in input)))))
+
+;; 1660
+(defn- re-conform [p [x & xs :as data]]
+  ;;(prn {:p p :x x :xs xs})
+  (if (empty? data)
+    (if (accept-nil? p)
+      (let [ret (preturn p)]
+        (if (= ret ::nil)
+          nil
+          ret))
+      ::invalid)
+    (if-let [dp (deriv p x)]
+      (recur dp xs)
+      ::invalid)))
+
+;; 1673
+(defn- re-explain [path via in re input]
+  (loop [p re [x & xs :as data] input i 0]
+    ;;(prn {:p p :x x :xs xs :re re}) (prn)
+    (if (empty? data)
+      (if (accept-nil? p)
+        nil ;;success
+        (op-explain (op-describe p) p path via in nil))
+      (if-let [dp (deriv p x)]
+        (recur dp xs (inc i))
+        (if (accept? p)
+          (if (= (::op p) ::pcat)
+            (op-explain (op-describe p) p path via (conj in i) (seq data))
+            [{:path path
+              :reason "Extra input"
+              :pred (op-describe re)
+              :val data
+              :via via
+              :in (conj in i)}])
+          (c/or (op-explain (op-describe p) p path via (conj in i) (seq data))
+                [{:path path
+                  :reason "Extra input"
+                  :pred (op-describe p)
+                  :val data
+                  :via via
+                  :in (conj in i)}]))))))
+
+;; 1699
+(defn regex-spec-impl
+  "Do not call this directly, use 'spec' with a regex op argument"
+  [re gfn]
+  (-> re
+      (dissoc ::op)
+      (assoc  :type ::spec
+              :cform (fn [_ x]
+                       (if (c/or (nil? x) (sequential? x))
+                         (re-conform re (seq x))
+                         ::invalid))
+              :unform (fn [_ x] (op-unform re x))
+              :explain (fn [_ path via in x]
+                         (if (c/or (nil? x) (sequential? x))
+                           (re-explain path via in re (seq x))
+                           [{:path path :pred (res `#(c/or (nil? %) (sequential? %))) :val x :via via :in in}]))
+              :describe (fn [_] (op-describe re)))))
+
+;; 1737
+(defn- validate-fn
+  "returns f if valid, else smallest"
+  [f specs iters]
+  #_(let [g (gen (:args specs))
+        prop (gen/for-all* [g] #(call-valid? f specs %))]
+    (let [ret (gen/quick-check iters prop)]
+      (if-let [[smallest] (-> ret :shrunk :smallest)]
+        smallest
+        f))))
+
+;; 1747
+(defn ^:skip-wiki fspec-impl
+  "Do not call this directly, use 'fspec'"
+  [argspec aform retspec rform fnspec fform gfn]
+  (let [specs {:args argspec :ret retspec :fn fnspec}]
+    (assoc specs
+           :type ::spec
+           :cform (fn [this _f]
+                    (throw (Exception. (str "Not implemented in spartan.spec.Can't conform fspec without args spec: " (pr-str (describe this)))))
+                    #_(if argspec
+                      (if (ifn? f)
+                        (if (identical? f (validate-fn f specs *fspec-iterations*)) f ::invalid)
+                        ::invalid)
+                      (throw (Exception. (str "Can't conform fspec without args spec: " (pr-str (describe this)))))))
+           :unform (fn [_ f] f)
+           :explain (fn [_ path via in f]
+                      (if (ifn? f)
+                        (let [args (validate-fn f specs 100)]
+                          (if (identical? f args) ;;hrm, we might not be able to reproduce
+                            nil
+                            (let [ret (try (apply f args) (catch Throwable t t))]
+                              (if (instance? Throwable ret)
+                                ;;TODO add exception data
+                                [{:path path :pred '(apply fn) :val args :reason (.getMessage ^Throwable ret) :via via :in in}]
+
+                                (let [cret (dt retspec ret rform)]
+                                  (if (invalid? cret)
+                                    (explain-1 rform retspec (conj path :ret) via in ret)
+                                    (when fnspec
+                                      (let [cargs (conform argspec args)]
+                                        (explain-1 fform fnspec (conj path :fn) via in {:args cargs :ret cret})))))))))
+                        [{:path path :pred 'ifn? :val f :via via :in in}]))
+           :describe (fn [_]
+                       `(fspec :args ~aform :ret ~rform :fn ~fform)))))
+
+;; 1794
+(clojure.spec.alpha/def ::kvs->map (conformer #(zipmap (map ::k %) (map ::v %)) #(map (fn [[k v]] {::k k ::v v}) %)))
+
+;; 1796
+(defmacro keys*
+  "takes the same arguments as spec/keys and returns a regex op that matches sequences of key/values,
+  converts them into a map, and conforms that map with a corresponding
+  spec/keys call:
+  user=> (s/conform (s/keys :req-un [::a ::c]) {:a 1 :c 2})
+  {:a 1, :c 2}
+  user=> (s/conform (s/keys* :req-un [::a ::c]) [:a 1 :c 2])
+  {:a 1, :c 2}
+  the resulting regex op can be composed into a larger regex:
+  user=> (s/conform (s/cat :i1 integer? :m (s/keys* :req-un [::a ::c]) :i2 integer?) [42 :a 1 :c 2 :d 4 99])
+  {:i1 42, :m {:a 1, :c 2, :d 4}, :i2 99}"
+  [& kspecs]
+  `(let [mspec# (clojure.spec.alpha/keys ~@kspecs)]
+     ;; NOTE: deleted with/gen
+     (clojure.spec.alpha/& (clojure.spec.alpha/* (clojure.spec.alpha/cat ::k keyword? ::v any?)) ::kvs->map mspec#)))
+
+; 1808
+(defn ^:skip-wiki nonconforming
+  "takes a spec and returns a spec that has the same properties except
+  'conform' returns the original (not the conformed) value. Note, will specize regex ops."
+  [spec]
+  (let [spec (delay (specize spec))]
+    {:type ::spec
+     :cform (fn [_ x]
+              (let [ret (conform* @spec x)]
+                (if (invalid? ret)
+                  ::invalid
+                  x)))
+     :unform (fn [_ x] x)
+     :explain (fn [_ path via in x] (explain* @spec path via in x))
+     :describe (fn [_] `(nonconforming ~(describe* @spec)))}))
+
+;; 1836
+(defn nilable-impl
+  "Do not call this directly, use 'nilable'"
+  [form pred]
+  (let [spec (delay (specize pred form))]
+    {:type ::spec
+     :cform (fn [_ x] (if (nil? x) nil (conform* @spec x)))
+     :unform (fn [_ x] (if (nil? x) nil (unform* @spec x)))
+     :explain (fn [_ path via in x]
+                (when-not (c/or (pvalid? @spec x) (nil? x))
+                  (conj
+                   (explain-1 form pred (conj path ::pred) via in x)
+                   {:path (conj path ::nil) :pred 'nil? :val x :via via :in in})))
+     :describe (fn [_] `(nilable ~(res form)))}))
+
+;; 1862
+(defmacro nilable
+  "returns a spec that accepts nil and values satisfying pred"
+  [pred]
+  (let [pf (res pred)]
+    `(nilable-impl '~pf ~pred)))
+
+;; 1910
+(defn int-in-range?
+  "Return true if start <= val, val < end and val is a fixed
+  precision integer."
+  [start end val]
+  (c/and (int? val) (<= start val) (< val end)))
+
+;; 1916
+(defmacro int-in
+  "Returns a spec that validates fixed precision integers in the
+  range from start (inclusive) to end (exclusive)."
+  [start end]
+  `(spec (and int? #(int-in-range? ~start ~end %))))
+
+;; 1923
+(defmacro double-in
+  "Specs a 64-bit floating point number. Options:
+    :infinite? - whether +/- infinity allowed (default true)
+    :NaN?      - whether NaN allowed (default true)
+    :min       - minimum value (inclusive, default none)
+    :max       - maximum value (inclusive, default none)"
+  [& {:keys [infinite? NaN? min max]
+    :or {infinite? true NaN? true}
+    :as m}]
+  `(spec (and c/double?
+              ~@(when-not infinite? '[#(not (Double/isInfinite %))])
+              ~@(when-not NaN? '[#(not (Double/isNaN %))])
+              ~@(when max `[#(<= % ~max)])
+              ~@(when min `[#(<= ~min %)]))))
+
+;; 1941
+#_(defonce
+  ^{:dynamic true
+    :doc "If true, compiler will enable spec asserts, which are then
+subject to runtime control via check-asserts? If false, compiler
+will eliminate all spec assert overhead. See 'assert'.
+Initially set to boolean value of clojure.spec.compile-asserts
+system property. Defaults to true."}
+  *compile-asserts*
+  (not= "false" (System/getProperty "clojure.spec.compile-asserts")))
+
+(defonce ^:dynamic *check-spec-asserts* false)
+
+;; 1952
+(defn check-asserts?
+  "Returns the value set by check-asserts."
+  []
+  *check-spec-asserts*)
+
+;; 1957
+(defn check-asserts
+  "Enable or disable spec asserts that have been compiled
+with '*compile-asserts*' true.  See 'assert'.
+Initially set to boolean value of clojure.spec.check-asserts
+system property. Defaults to false."
+  [flag]
+  (alter-var-root #'*check-spec-asserts* (constantly flag)))
+
+;; 1966
+(defn assert*
+  "Do not call this directly, use 'assert'."
+  [spec x]
+  (if (valid? spec x)
+    x
+    (let [ed (c/merge (assoc (explain-data* spec [] [] [] x)
+                                        ::failure :assertion-failed))]
+      (throw (ex-info
+              (str "Spec assertion failed\n" (with-out-str (explain-out ed)))
+              ed)))))
+
+;; 1977
+(defmacro assert
+  "spec-checking assert expression. Returns x if x is valid? according
+to spec, else throws an ex-info with explain-data plus ::failure of
+:assertion-failed.
+Can be disabled at either compile time or runtime:
+If *compile-asserts* is false at compile time, compiles to x. Defaults
+to value of 'clojure.spec.compile-asserts' system property, or true if
+not set.
+If (check-asserts?) is false at runtime, always returns x. Defaults to
+value of 'clojure.spec.check-asserts' system property, or false if not
+set. You can toggle check-asserts? with (check-asserts bool)."
+  [spec x]
+  `(if *check-spec-asserts*
+     (assert* ~spec ~x)
+     ~x))
+(ns pg-copycat.export
+  (:require
+   [pg-copycat.utils :as u ]
+   [babashka.fs :as fs]
+   [spartan.spec]
+   [clojure.java.shell :as shell]
+   [honey.sql :as hsql]
+   [clojure.term.colors :as c]))
+
+(def temp-folder
+  (fs/temp-dir))
+
+(defn- build-select-query
+  "Takes <tbl> name, where hsql query and limit-no and builds query."
+  [tb-opts]
+  (let [tb (:tbname tb-opts)
+        extra-opts (dissoc tb-opts :tbname)]
+    (hsql/format
+     (merge {:select [:*] :from [tb]}
+            extra-opts)
+     {:inline true})))
+
+(defn- stdout-to-file!
+  "Reads bash output and writes it to a file."
+  [stdout dir filename]
+  (if (and (empty? (:err stdout)) (zero? (:exit stdout)))
+    (do (spit (fs/file dir filename) (:out stdout))
+        (u/status-map filename (c/green "OK!") true))
+    (u/status-map nil (c/red (:err stdout)) false)))
+    
+(defn- dump-structure!
+  "Dump db's structure."
+  [{:keys [host port dbname username]} folder]
+  (println (format "Exporting %s structure..." dbname))
+  (let [cmdout (-> (shell/sh "pg_dump"
+                             "--clean"
+                             "-h" host
+                             "-d" dbname
+                             "-U" username
+                             "-p" (str port)
+                             "-x" "-O" "-s")
+                   (stdout-to-file! folder dbname))]
+    (println (:message cmdout))))
+
+(defmulti dump-data!
+  "Dumps table-data from database configured in <ds-opts>.
+  It takes <tbname>, hsql form of <where> and limit-no to build a query."
+  (fn [db-opts _ _]
+    (:dbtype db-opts)))
+
+(defmethod dump-data! "postgresql"
+  [db-opts tb-opts folder]
+  (let [query (build-select-query tb-opts)
+        {:keys [host port dbname username]} db-opts]
+    (println (format "Exporting data from pg table : %s" (:tbname tb-opts)))
+    (let [cmdout 
+          (-> (shell/sh
+               "psql"
+               "-h" host
+               "-d" dbname
+               "-U" username
+               "-p" (str port)
+               "-c" (format "COPY (%s) TO STDOUT with (format csv, header, delimiter '|')" (first query)))
+              (stdout-to-file! folder (name (:tbname tb-opts))))]
+      (println (:message cmdout)))))
+
+(defn create-structure-folder! [name]
+  (u/touch-dir! temp-folder (format "structure_%s" name)))
+
+(defn export-structure!
+  "Exports complete pre-data.
+   It creates one file prers existing schema."
+  [db-opts]
+  (let [folder (create-structure-folder! (:dbname db-opts)) 
+        filename (u/zip-filename folder)]
+    (dump-structure! db-opts folder)
+    (u/zip-and-delete! folder filename)
+    (u/move-file! filename (:gcs db-opts))))
+
+(defn create-data-folder! [name dbname]
+  (u/touch-dir! temp-folder
+                "data"
+                (format "dataset_%s_%s"
+                        name dbname)))
+
+(defn export-data!
+  "Exports table data based on datasets' configurations."
+  [db-opts]
+  (doseq [ds-file (:dataset db-opts)]
+    (println ds-file)
+    (if (fs/exists? ds-file)
+      (let [folder (create-data-folder! (u/filename-no-ext ds-file)
+                                        (:dbname db-opts)) 
+            dataset  (read-string (slurp ds-file))
+            max-tb   (count dataset)
+            filename (u/zip-filename folder)]
+        (doseq [[idx item] (map-indexed vector dataset)]
+          (println (format "%d/%d" (inc idx) max-tb))
+          (dump-data! db-opts item folder))
+        (u/zip-and-delete! folder filename)
+        (u/move-file! filename (:gcs db-opts)))
+      (println (c/red (format "%s file is missing!" ds-file))))))
+
+(ns pg-copycat.doctor
+  (:require
+   [pg-copycat.utils :refer [gcloud-auth?]]
+   [clojure.java.shell :as shell]
+   [clojure.term.colors :as c]
+   [babashka.fs :as fs]))
+
+
+(def prerequisities
+  [["gcloud"  "To communicate with the bucket where you may want to download from or upload files to."]
+   ["docker"  "Should be installed if you want to run a local database."]
+   ["psql"    "Used when exporting data from tables. It is also used when importing data."]
+   ["pg_dump" "Used to export pre-data and post-data."]
+   ["zip"     "To pack files during export."]
+   ["unzip"   "The unpack files during import."]])
+
+(defn where-installed?
+  "Checks if you have installed <command>"
+  [command]
+  (let [out (shell/sh "bash" "-c"
+                      (str  "type " command))]
+    out))
+
+(defn print-status
+  ([cmd-name info]
+   (println (c/red (format "%s has not been found!" cmd-name))
+            (c/white info))
+   (newline))
+  ([cmd-name info out]
+   (println (c/green (format "%s has been found in: %s" cmd-name out))
+            (c/white info))
+   (newline)))
+
+(defn check-installed
+  "Checks if you have installed psql and pg_dump.
+  It also checks db connection before any action."
+  []
+  (println (c/blue "<-@-@-@-@-@-@-@-@-@-@-@-@-@-@->"))
+  (println (c/on-grey (c/bold "Checking installed software:")))
+  (doseq [[cmd-name info] prerequisities]
+    (let [cmd (where-installed? cmd-name)]
+      (if (zero? (:exit cmd))
+        (print-status cmd-name info (:out cmd))
+        (print-status cmd-name info))))
+  (println (c/on-grey (c/bold "Checking other prerequisites:")))
+  (if (fs/exists? (fs/file (System/getProperty "user.home") ".pgpass"))
+    (println (c/green ".pgpass has been found. It's passwords might be used."))
+    (println (c/red ".pgpass has not been found! You should create it and configure access to your databases.")))
+  (if (gcloud-auth?)
+    (println (c/green "You appear to be logged to GCLOUD CLI Tools."))
+    (println (c/red "Do 'gcloud auth login' to access Google Cloud Storage.")))
+  (c/blue "<-@-@-@-@-@-@-@-@-@-@-@-@-@-@->"))
+  
+(ns pg-copycat.core
+  (:gen-class)
+  (:require
+   [clojure.string :refer [join]]
+   [pg-copycat.doctor :refer [check-installed]]
+   [pg-copycat.export :as export]
+   [pg-copycat.import :as import]
+   [clojure.term.colors :as c]
+   [pg-copycat.utils :refer [connected? valid-bucket?]]
+   [clojure.tools.cli :refer [parse-opts]]
+   [babashka.fs :as fs]))
+
+(def LOGO
+  "+------------------------+\n|   ____  ______  ___    |\n|  /    )/      \\/   \\   |\n| (     / __    _\\    )  |\n|  \\    (/ x)  ( x)   )  |\n|   \\_  (_  )   \\ )  /   |\n|     \\  /\\_/    \\)_/    |\n|      \\/  //|  |\\\\      |\n|      /   v |  | v      |\n|     /     \\__/    \\    |\n|    /               \\   |\n|   |     (^^\\/^^)    |  |\n|   |      \\^  ^/     |  |\n|   |       \\^^/      |  |   \n|   |        \\/       |  | \n|    \\_______________/   |\n|    pg_copycat   0.0.1  |\n|                        |\n+------------------------+\n")
+
+(def cli-options
+  [["-c"           "--config-path CONFIG-PATH}" "A path to EDN config file containing a database configuration."]
+   [ "-d"           "--dataset DATASET" "Specifies the dataset to be imported or exported. Can be used more than once."
+    :multi         true
+    :default       []
+    :update-fn     conj]
+   ["-g"           "--gcs GCS" "The name of GCS you will use for import or export."]
+   ["-f"           "--filename FILENAME" "Search for a file during import - use a partion or an exact filename."
+    :default       nil]
+   ["-H"           "--help" "Print this help information"]
+   [nil             "--version" "Print version and exit"]])
+
+(defn usage [options-summary]
+  (->> [(c/cyan LOGO) 
+        ""
+        "Usage: pg_copycat [options] action"
+        ""
+        "Options:"
+        options-summary
+        ""
+        "Actions:"
+        "  doctor              Check installed software."
+        "  export-structure    Export DB structure to a timestamped ZIP file,"
+        "  export-data         Export dataset(s)' to ZIP file(s)."
+        "  export-all          Run export-structure and export-data."
+        "  import-structure    Import structure ZIP file."
+        "  import-data         Import dataset(s)' ZIP file(s)."
+        "  import-all          Run import-structure and import-data."
+        ""
+        "Please refer to the manual page for more information."]
+       (join \newline)))
+
+
+
+(defn error-msg [errors]
+  (str "The following errors occurred while parsing your command:\n\n"
+       (join \newline errors)))
+
+(defn validate-action [action]
+  (#{"export-structure" "export-data" "export-all"
+     "import-structure" "import-data" "import-all"}
+   action))
+
+(defn validate-args [args]
+  (let [{:keys [options arguments errors summary]} (parse-opts args cli-options)]
+    (cond
+      (:help options)
+      {:exit-message (usage summary) :ok? true}
+      errors
+      {:exit-message (error-msg errors)}
+      (= "doctor" (first arguments))
+      {:exit-message (check-installed) :ok? true}
+      :else
+      (if-let [config-file (:config-path options)]
+        (if (fs/exists? config-file)
+          (let [options (merge options (read-string (slurp config-file)))]
+            (cond
+              (not (connected? options))
+              {:exit-message (format "Cannot connect to database [%s]" (:dbname options))}
+              (not (valid-bucket? options))
+              {:exit-message (format "Cannot access %s" (:gcs options))}
+              (and (= 1 (count arguments)) (validate-action (first arguments)))
+              {:action (first arguments) :options options}
+              :else
+              {:exit-message "You are missing a correct action argument"}))
+          {:exit-message (format "%s does not seems like a valid config file!" (:config-path options))})
+        {:exit-message (usage summary)}))))
+
+(defn exit [status msg]
+  (println msg)
+  (println "Exiting...")
+  (System/exit status))
+
+(defn -main [& args]
+  (let [{:keys [action options exit-message ok?]} (validate-args args)]
+    (if exit-message
+      (exit (if ok? 0 1) exit-message)
+      (case action
+        "export-structure"  (export/export-structure!       options)
+        "export-data"       (export/export-data!            options) 
+        "export-all"        (do (export/export-structure!   options)
+                                (export/export-data!        options))
+        "import-structure"  (import/import-structure!       options)
+        "import-data"       (import/import-data!            options)
+        "import-all"        (do (import/import-structure!   options)
+                                (import/import-data!        options))))))
+
+
+
+
+(ns user (:require [pg-copycat.core])) (apply pg-copycat.core/-main *command-line-args*)

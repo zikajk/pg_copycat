@@ -1,0 +1,6 @@
+{:paths          ["src" "test"]
+ :deps           {seancorfield/honeysql                                  {:mvn/version "2.0.0-beta2"}
+                  douglass/clj-psql                                      {:mvn/version "0.1.2"}
+                  clojure-term-colors/clojure-term-colors                {:mvn/version "0.1.0"}
+                  borkdude/spartan.spec                                  {:git/url "https://github.com/borkdude/spartan.spec"
+                                                                          :sha "12947185b4f8b8ff8ee3bc0f19c98dbde54d4c90"}}}

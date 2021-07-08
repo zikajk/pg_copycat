@@ -1,0 +1,5 @@
+ {:dbtype   "postgresql"
+  :dbname   "xbi_01_db"
+  :port      5435
+  :host     "localhost"
+  :username "postgres"}
